@@ -1,9 +1,9 @@
 import sys
 import logging
 import datetime
-import json
 import os
 import time
+import argparse
 import threading
 from pathlib import Path
 import yfinance as yf
@@ -51,8 +51,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 
-STATE_FILE = BASE_DIR / ".eod_state.json"
-
 def is_market_open():
     now = datetime.datetime.now()
     if now.weekday() >= 5:
@@ -62,10 +60,14 @@ def is_market_open():
     return market_start <= now <= market_end
 
 def should_trigger_mail(mailer_mode):
-    """Determines whether EOD / EOW / EOM email report should be sent."""
+    """Determines whether EOD / EOW / EOM or Debug (NOW) email report should be sent."""
     now = datetime.datetime.now()
-    eod_cutoff = now.replace(hour=15, minute=30, second=0, microsecond=0)
     
+    # Debugging trigger: bypasses all time checks
+    if mailer_mode == "NOW":
+        return True
+
+    eod_cutoff = now.replace(hour=15, minute=30, second=0, microsecond=0)
     if now < eod_cutoff:
         return False
 
@@ -79,50 +81,22 @@ def should_trigger_mail(mailer_mode):
 
     return False
 
-def load_eod_state():
-    today = str(datetime.date.today())
-    default_state = {
-        "date": today,
-        "start_cash": 10000.0,
-        "current_cash": 10000.0,
-        "transactions": [],
-        "mail_sent_for_period": False
-    }
-    if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, "r") as f:
-                state = json.load(f)
-                if state.get("date") == today:
-                    return state
-        except Exception as e:
-            logger.error(f"Error reading state file: {e}")
-            
-    with open(STATE_FILE, "w") as f:
-        json.dump(default_state, f, indent=2)
-    return default_state
-
-def save_eod_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
 def calculate_dynamic_allocation(available_cash, alloc_pct, min_alloc, max_alloc):
     calculated = available_cash * alloc_pct
     allocation = max(min_alloc, min(calculated, max_alloc))
     return min(allocation, available_cash)
 
 def evaluate_buy_signal(metrics, available_cash, min_alloc, max_alloc, alloc_pct, rsi_lower):
-    """Evaluates BUY signals against dynamically loaded .env bounds."""
+    """Evaluates BUY signals against dynamically loaded bounds."""
     price = metrics.get("price", 0.0)
     signals = metrics.get("signals", [])
     rsi = metrics.get("rsi", 50.0)
 
-    # 1 & 2. Upper and Lower Bound Validation
     if price > max_alloc or price < min_alloc:
         return None, 0.0, ""
 
     suggested_capital = calculate_dynamic_allocation(available_cash, alloc_pct, min_alloc, max_alloc)
 
-    # 3. Available Demat Capital Validation
     if suggested_capital < price or available_cash < price:
         return None, 0.0, ""
 
@@ -149,8 +123,6 @@ def evaluate_buy_signal(metrics, available_cash, min_alloc, max_alloc, alloc_pct
 
 def evaluate_sell_signal(holding, metrics, rsi_upper):
     """Evaluates SELL signals for active holdings in your Angel One portfolio."""
-    ticker = holding.get("ticker")
-    qty = holding.get("qty", 0)
     avg_price = holding.get("avg_price", 0.0)
     current_price = metrics.get("price", holding.get("current_price", 0.0))
     rsi = metrics.get("rsi", 50.0)
@@ -160,54 +132,51 @@ def evaluate_sell_signal(holding, metrics, rsi_upper):
 
     if rsi >= rsi_upper or "MACD_BEARISH_CROSS" in signals or "RSI_OVERBOUGHT" in signals:
         return (
-            f"SELL (EXIT / TAKE PROFIT)",
+            "SELL (EXIT / TAKE PROFIT)",
             f"RSI overbought ({rsi:.1f}) or bearish crossover detected. P&L: {pnl_pct:+.2f}%"
         )
-    elif pnl_pct <= -5.0:  # 5% Stop loss rule
+    elif pnl_pct <= -5.0:
         return (
-            f"SELL (STOP LOSS)",
+            "SELL (STOP LOSS)",
             f"Position hit stop loss threshold of -5.0% (Current P&L: {pnl_pct:.2f}%)."
         )
 
     return None, ""
 
 def clean_ticker_for_yfinance(symbol: str) -> str:
-    """Removes broker suffixes like '-EQ' or '-BE' and formats for Yahoo Finance (.NS)."""
     s = symbol.replace("-EQ", "").replace("-BE", "").strip()
     return s if s.endswith(".NS") else f"{s}.NS"
 
-def run_pipeline():
-    # ==========================================================
-    # 1. FRESH START: Reload .env dynamically on every loop round
-    # ==========================================================
+def run_pipeline(force_email_now=False):
+    # Load environment variables dynamically on each run
     load_dotenv(BASE_DIR / ".env", override=True)
 
-    # Dynamic Bounds & Configs
     min_alloc = float(os.getenv("MIN_TRADE_ALLOCATION", 100.0))
     max_alloc = float(os.getenv("MAX_TRADE_ALLOCATION", 500.0))
     alloc_pct = float(os.getenv("PORTFOLIO_ALLOCATION_PCT", 0.10))
     rsi_lower = float(os.getenv("RSI_LOWER_THRESHOLD", 35.0))
     rsi_upper = float(os.getenv("RSI_UPPER_THRESHOLD", 65.0))
     tickers_count = int(os.getenv("TICKERS_COUNT", 50))
-    mailer_mode = os.getenv("MAILER_TIME", "EOD").upper()
+    
+    # Determine mailer mode
+    mailer_mode = "NOW" if force_email_now else os.getenv("MAILER_TIME", "EOD").upper()
+    
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
     credentials_file = BASE_DIR / os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 
     logger.info(f"{CLR_BOLD}--- Cycle Configuration Loaded ---{CLR_RESET}")
-    logger.info(f"Price Window: ₹{min_alloc} - ₹{max_alloc} | Cap Alloc: {alloc_pct*100}% | Tickers: {tickers_count}")
+    logger.info(f"Price Window: ₹{min_alloc} - ₹{max_alloc} | Cap Alloc: {alloc_pct*100}% | Mailer Mode: {mailer_mode}")
 
-    state = load_eod_state()
     market_active = is_market_open()
-    
-    # Process commands if fallback polling is used
+
     process_telegram_commands()
 
-    # Fetch Angel One Demat account info
-    logger.info("Authenticating with Angel One SmartAPI to fetch live portfolio...")
+    # Dynamic API fetch from Angel One
+    logger.info("Authenticating with Angel One SmartAPI to fetch dynamic portfolio...")
     angel_client = AngelOneClient()
     real_portfolio = angel_client.get_real_portfolio_data()
 
-    available_cash = real_portfolio.get("available_cash", 0.0) if real_portfolio else state["current_cash"]
+    available_cash = real_portfolio.get("available_cash", 0.0) if real_portfolio else 0.0
     holdings = real_portfolio.get("holdings", []) if real_portfolio else []
 
     logger.info(f"Available Demat Capital: ₹{available_cash:,.2f} | Active Holdings: {len(holdings)}")
@@ -217,7 +186,7 @@ def run_pipeline():
     raw_data = []
 
     if market_active:
-        # 1. EVALUATE SELL SIGNALS FOR ACTIVE HOLDINGS FIRST
+        # 1. EVALUATE SELL SIGNALS FOR ACTIVE HOLDINGS
         if holdings:
             logger.info("Scanning active Angel One holdings for SELL triggers...")
             holding_tickers = [clean_ticker_for_yfinance(h["ticker"]) for h in holdings if h.get("ticker")]
@@ -245,7 +214,7 @@ def run_pipeline():
                     except Exception as e:
                         logger.error(f"Error evaluating holding {t_raw}: {e}")
 
-        # 2. SCAN NSE MARKET FOR CANDIDATE BUY SIGNALS
+        # 2. SCAN NSE MARKET FOR BUY SIGNALS
         tickers = get_dynamic_tickers(tickers_count) if 'tickers_count' in str(get_dynamic_tickers.__code__.co_varnames) else get_dynamic_tickers()
         logger.info(f"{CLR_BOLD}{CLR_GREEN}Market is LIVE.{CLR_RESET} Sweeping {len(tickers)} market tickers...")
         
@@ -289,7 +258,7 @@ def run_pipeline():
     else:
         logger.info(f"{CLR_BOLD}{CLR_YELLOW}Market is CLOSED.{CLR_RESET} Skipping real-time market scan.")
 
-    # 3. Google Sheets Sync
+    # 3. GOOGLE SHEETS SYNCHRONIZATION
     if credentials_file.exists() and spreadsheet_id:
         try:
             sync_dashboard_data(
@@ -305,24 +274,25 @@ def run_pipeline():
         except Exception as e:
             logger.error(f"Google Sheets sync error: {e}")
 
-    # 4. Scheduled Email Check
-    if should_trigger_mail(mailer_mode) and not state.get("mail_sent_for_period", False):
-        logger.info(f"{CLR_BOLD}{CLR_CYAN}Triggering [{mailer_mode}] Mailer Report...{CLR_RESET}")
-        sent = send_eod_email_report(
-            start_cash=state["start_cash"],
+    # 4. EMAIL REPORT DISPATCH
+    if should_trigger_mail(mailer_mode):
+        logger.info(f"{CLR_BOLD}{CLR_CYAN}Sending Email Report (Trigger Mode: {mailer_mode})...{CLR_RESET}")
+        send_eod_email_report(
+            start_cash=available_cash,
             end_cash=available_cash,
-            transactions=state["transactions"]
+            transactions=[]
         )
-        if sent:
-            state["mail_sent_for_period"] = True
-            save_eod_state(state)
 
     return market_active
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ASTRA Algorithmic Trading Engine")
+    parser.add_argument("--email-now", action="store_true", help="Force send an immediate debug email report")
+    args = parser.parse_args()
+
     logger.info(f"{CLR_BOLD}{CLR_MAGENTA}=== Starting ASTRA Engine ==={CLR_RESET}")
     
-    # Option: Launch Telegram Bot in background thread if supported
+    # Initialize background Telegram bot thread
     if "run_telegram_bot_loop" in globals():
         bot_thread = threading.Thread(target=run_telegram_bot_loop, daemon=True)
         bot_thread.start()
@@ -330,15 +300,18 @@ if __name__ == "__main__":
 
     try:
         while True:
-            # Re-read buffer on every iteration
             load_dotenv(BASE_DIR / ".env", override=True)
             env_cycle_buffer = int(os.getenv("ASTRA_CYCLE_BUFFER", 5))
             live_loop_interval = max(3, env_cycle_buffer) * 60
             closed_loop_interval = 15 * 60
 
             start_time = time.time()
-            market_active = run_pipeline()
+            market_active = run_pipeline(force_email_now=args.email_now)
             
+            # Reset CLI flag after first iteration
+            if args.email_now:
+                args.email_now = False
+
             elapsed = time.time() - start_time
             target_interval = live_loop_interval if market_active else closed_loop_interval
             sleep_duration = max(0, target_interval - elapsed)

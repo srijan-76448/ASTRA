@@ -388,16 +388,85 @@ async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays portfolio state."""
+    """Fetches and displays live portfolio state directly from SmartAPI."""
     if IS_SUSPENDED:
         return
 
-    msg = (
-        "<b>📊 PORTFOLIO TELEMETRY</b>\n"
-        "-------------------------------------\n"
-        "Position tracking active. Check cycle execution logs for live data sync."
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await update.message.reply_text("🔄 <i>Fetching live portfolio telemetry...</i>", parse_mode="HTML")
+
+    try:
+        # Import your initialized SmartAPI client/wrapper instance here
+        from broker_connector import get_smart_api_instance  # Adjust import path to match your structure
+        smart_api = get_smart_api_instance()
+
+        if not smart_api:
+            await update.message.reply_text("❌ Failed to connect to Angel One API.", parse_mode="HTML")
+            return
+
+        # Fetch live holdings and RMS limits
+        holdings_res = smart_api.holding()
+        rms_res = smart_api.rmsLimit()
+
+        total_invested = 0.0
+        total_current = 0.0
+        holding_details = []
+
+        if holdings_res and holdings_res.get("status") and holdings_res.get("data"):
+            holdings = holdings_res["data"]
+            for item in holdings:
+                qty = int(item.get("quantity", 0))
+                avg_price = float(item.get("averageprice", 0.0))
+                ltp = float(item.get("ltp", 0.0))
+                symbol = item.get("tradingsymbol", "N/A")
+
+                inv_val = qty * avg_price
+                curr_val = qty * ltp
+                total_invested += inv_val
+                total_current += curr_val
+
+                pnl = curr_val - inv_val
+                pnl_pct = (pnl / inv_val * 100) if inv_val > 0 else 0.0
+                pnl_icon = "🟢" if pnl >= 0 else "🔴"
+
+                holding_details.append(
+                    f"• <b>{symbol}</b> ({qty} Qty)\n"
+                    f"  Avg: ₹{avg_price:,.2f} | LTP: ₹{ltp:,.2f}\n"
+                    f"  P&amp;L: {pnl_icon} ₹{pnl:,.2f} ({pnl_pct:+.2f}%)"
+                )
+
+        total_pnl = total_current - total_invested
+        total_pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0.0
+        pnl_overall_icon = "🟢" if total_pnl >= 0 else "🔴"
+
+        # Fetch available demat funds
+        available_cash = 0.0
+        if rms_res and rms_res.get("status") and rms_res.get("data"):
+            available_cash = float(rms_res["data"].get("net", 0.0))
+
+        # Format output message
+        holdings_str = "\n".join(holding_details) if holding_details else "<i>No active holdings.</i>"
+        
+        msg = (
+            "<b>📊 LIVE PORTFOLIO TELEMETRY</b>\n"
+            "-------------------------------------\n"
+            f"💰 <b>Available Cash:</b> ₹{available_cash:,.2f}\n"
+            f"💼 <b>Total Invested:</b> ₹{total_invested:,.2f}\n"
+            f"📈 <b>Current Value:</b> ₹{total_current:,.2f}\n"
+            f"{pnl_overall_icon} <b>Total Realized P&amp;L:</b> ₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)\n"
+            "-------------------------------------\n"
+            "<b>Active Positions:</b>\n"
+            f"{holdings_str}"
+        )
+
+        logger.info("Fetched live portfolio telemetry for /portfolio command.")
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Failed to pull live portfolio for Telegram: {e}")
+        await update.message.reply_text(
+            f"❌ <b>Error pulling live portfolio:</b> <code>{str(e)}</code>",
+            parse_mode="HTML"
+        )
 
 
 async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
