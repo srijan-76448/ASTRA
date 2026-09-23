@@ -244,9 +244,13 @@ python src/main.py
 
 You can interact with ASTRA in real time directly from your Telegram chat:
 
-* `/status` — Displays current loop execution status, market state (LIVE/CLOSED), and capital bounds.
-* `/portfolio` — Returns live Angel One available cash liquidity and active Demat holdings with real-time P&L breakdown.
-* `/help` — Lists all available Telegram commands.
+* `/status` — Output system status and cycle info
+* `/sheet` or `/spreadsheet` — Get live Google Sheets telemetry URL
+* `/config` or `/cfg` — Read raw .env configuration
+* `/set KEY VALUE` — Set or overwrite any .env variable
+* `/restore_default` or `/restore` — Restore .env from .env.bak
+* `/suspend DURATION` — Pause system (e.g., /suspend 5m or /suspend 2h)
+* `/portfolio` — Output live portfolio feed
 
 ---
 
