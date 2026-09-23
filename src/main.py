@@ -4,22 +4,22 @@ import datetime
 import json
 import os
 import time
+import threading
 from pathlib import Path
 import yfinance as yf
 from dotenv import load_dotenv
 
 # Path Setup
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env")
 sys.path.append(str(BASE_DIR / "src"))
 
 # Internal Modules
 from decision_engine import analyze_ticker_data
 from portfolio_fetcher import sync_dashboard_data
-from telegram import send_investment_suggestion, process_telegram_commands
 from mailer import send_eod_email_report
 from tickers import get_dynamic_tickers
 from smartapi import AngelOneClient
+from telegram_bot import send_investment_suggestion, process_telegram_commands, run_telegram_bot_loop
 
 # Terminal ANSI Color Codes
 CLR_RESET = "\033[0m"
@@ -52,23 +52,6 @@ logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 
 STATE_FILE = BASE_DIR / ".eod_state.json"
-SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
-CREDENTIALS_FILE = BASE_DIR / os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
-
-# Threshold & Config Bounds
-MIN_ALLOCATION = float(os.getenv("MIN_TRADE_ALLOCATION", 100.0))
-MAX_ALLOCATION = float(os.getenv("MAX_TRADE_ALLOCATION", 500.0))
-ALLOCATION_PCT = float(os.getenv("PORTFOLIO_ALLOCATION_PCT", 0.10))
-
-RSI_LOWER = float(os.getenv("RSI_LOWER_THRESHOLD", 35.0))
-RSI_UPPER = float(os.getenv("RSI_UPPER_THRESHOLD", 65.0))
-TICKERS_COUNT = int(os.getenv("TICKERS_COUNT", 50))
-
-env_cycle_buffer = int(os.getenv("ASTRA_CYCLE_BUFFER", 5))
-LIVE_LOOP_INTERVAL = max(3, env_cycle_buffer) * 60
-CLOSED_LOOP_INTERVAL = 15 * 60
-
-MAILER_TIME_MODE = os.getenv("MAILER_TIME", "EOD").upper()
 
 def is_market_open():
     now = datetime.datetime.now()
@@ -78,7 +61,7 @@ def is_market_open():
     market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_start <= now <= market_end
 
-def should_trigger_mail():
+def should_trigger_mail(mailer_mode):
     """Determines whether EOD / EOW / EOM email report should be sent."""
     now = datetime.datetime.now()
     eod_cutoff = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -86,11 +69,11 @@ def should_trigger_mail():
     if now < eod_cutoff:
         return False
 
-    if MAILER_TIME_MODE == "EOD":
+    if mailer_mode == "EOD":
         return True
-    elif MAILER_TIME_MODE == "EOW":
+    elif mailer_mode == "EOW":
         return now.weekday() == 4
-    elif MAILER_TIME_MODE == "EOM":
+    elif mailer_mode == "EOM":
         tomorrow = now + datetime.timedelta(days=1)
         return tomorrow.day == 1
 
@@ -122,43 +105,38 @@ def save_eod_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-def calculate_dynamic_allocation(available_cash):
-    calculated = available_cash * ALLOCATION_PCT
-    allocation = max(MIN_ALLOCATION, min(calculated, MAX_ALLOCATION))
+def calculate_dynamic_allocation(available_cash, alloc_pct, min_alloc, max_alloc):
+    calculated = available_cash * alloc_pct
+    allocation = max(min_alloc, min(calculated, max_alloc))
     return min(allocation, available_cash)
 
-def evaluate_buy_signal(metrics, available_cash):
-    """
-    Evaluates BUY signals against:
-    1. Upper bound (.env)
-    2. Lower bound (.env)
-    3. Available Demat capital
-    """
+def evaluate_buy_signal(metrics, available_cash, min_alloc, max_alloc, alloc_pct, rsi_lower):
+    """Evaluates BUY signals against dynamically loaded .env bounds."""
     price = metrics.get("price", 0.0)
     signals = metrics.get("signals", [])
     rsi = metrics.get("rsi", 50.0)
 
     # 1 & 2. Upper and Lower Bound Validation
-    if price > MAX_ALLOCATION or price < MIN_ALLOCATION:
+    if price > max_alloc or price < min_alloc:
         return None, 0.0, ""
 
-    suggested_capital = calculate_dynamic_allocation(available_cash)
+    suggested_capital = calculate_dynamic_allocation(available_cash, alloc_pct, min_alloc, max_alloc)
 
     # 3. Available Demat Capital Validation
     if suggested_capital < price or available_cash < price:
         return None, 0.0, ""
 
-    if rsi <= RSI_LOWER and "MACD_BULLISH_CROSS" in signals:
+    if rsi <= rsi_lower and "MACD_BULLISH_CROSS" in signals:
         return (
             "BUY (INTRA-DAY / SHORT-TERM)",
             suggested_capital,
             f"Oversold bounce (RSI {rsi:.1f}) + MACD Bullish Crossover. Capital verified."
         )
-    elif rsi <= RSI_LOWER:
+    elif rsi <= rsi_lower:
         return (
             "BUY (LONG-TERM SIP)",
             suggested_capital,
-            f"Value entry zone (RSI {rsi:.1f} <= {RSI_LOWER}). Capital verified."
+            f"Value entry zone (RSI {rsi:.1f} <= {rsi_lower}). Capital verified."
         )
     elif rsi < 45 and "MACD_BULLISH_CROSS" in signals:
         return (
@@ -169,10 +147,8 @@ def evaluate_buy_signal(metrics, available_cash):
 
     return None, 0.0, ""
 
-def evaluate_sell_signal(holding, metrics):
-    """
-    Evaluates SELL signals for active holdings in your Angel One portfolio.
-    """
+def evaluate_sell_signal(holding, metrics, rsi_upper):
+    """Evaluates SELL signals for active holdings in your Angel One portfolio."""
     ticker = holding.get("ticker")
     qty = holding.get("qty", 0)
     avg_price = holding.get("avg_price", 0.0)
@@ -182,7 +158,7 @@ def evaluate_sell_signal(holding, metrics):
 
     pnl_pct = ((current_price - avg_price) / avg_price) * 100 if avg_price > 0 else 0.0
 
-    if rsi >= RSI_UPPER or "MACD_BEARISH_CROSS" in signals or "RSI_OVERBOUGHT" in signals:
+    if rsi >= rsi_upper or "MACD_BEARISH_CROSS" in signals or "RSI_OVERBOUGHT" in signals:
         return (
             f"SELL (EXIT / TAKE PROFIT)",
             f"RSI overbought ({rsi:.1f}) or bearish crossover detected. P&L: {pnl_pct:+.2f}%"
@@ -201,9 +177,29 @@ def clean_ticker_for_yfinance(symbol: str) -> str:
     return s if s.endswith(".NS") else f"{s}.NS"
 
 def run_pipeline():
+    # ==========================================================
+    # 1. FRESH START: Reload .env dynamically on every loop round
+    # ==========================================================
+    load_dotenv(BASE_DIR / ".env", override=True)
+
+    # Dynamic Bounds & Configs
+    min_alloc = float(os.getenv("MIN_TRADE_ALLOCATION", 100.0))
+    max_alloc = float(os.getenv("MAX_TRADE_ALLOCATION", 500.0))
+    alloc_pct = float(os.getenv("PORTFOLIO_ALLOCATION_PCT", 0.10))
+    rsi_lower = float(os.getenv("RSI_LOWER_THRESHOLD", 35.0))
+    rsi_upper = float(os.getenv("RSI_UPPER_THRESHOLD", 65.0))
+    tickers_count = int(os.getenv("TICKERS_COUNT", 50))
+    mailer_mode = os.getenv("MAILER_TIME", "EOD").upper()
+    spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
+    credentials_file = BASE_DIR / os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
+
+    logger.info(f"{CLR_BOLD}--- Cycle Configuration Loaded ---{CLR_RESET}")
+    logger.info(f"Price Window: ₹{min_alloc} - ₹{max_alloc} | Cap Alloc: {alloc_pct*100}% | Tickers: {tickers_count}")
+
     state = load_eod_state()
     market_active = is_market_open()
     
+    # Process commands if fallback polling is used
     process_telegram_commands()
 
     # Fetch Angel One Demat account info
@@ -236,7 +232,7 @@ def run_pipeline():
                         if not df_h.empty:
                             h_metrics = analyze_ticker_data(df_h)
                             if h_metrics:
-                                sell_action, sell_reasoning = evaluate_sell_signal(h, h_metrics)
+                                sell_action, sell_reasoning = evaluate_sell_signal(h, h_metrics, rsi_upper)
                                 if sell_action:
                                     logger.info(f"{CLR_BOLD}{CLR_RED}🔴 SELL Signal [{t_raw}]:{CLR_RESET} {sell_action}")
                                     send_investment_suggestion(
@@ -250,7 +246,7 @@ def run_pipeline():
                         logger.error(f"Error evaluating holding {t_raw}: {e}")
 
         # 2. SCAN NSE MARKET FOR CANDIDATE BUY SIGNALS
-        tickers = get_dynamic_tickers()
+        tickers = get_dynamic_tickers(tickers_count) if 'tickers_count' in str(get_dynamic_tickers.__code__.co_varnames) else get_dynamic_tickers()
         logger.info(f"{CLR_BOLD}{CLR_GREEN}Market is LIVE.{CLR_RESET} Sweeping {len(tickers)} market tickers...")
         
         if tickers:
@@ -269,7 +265,9 @@ def run_pipeline():
                     scan_results[ticker] = metrics
                     price = metrics["price"]
 
-                    strategy, amount, reasoning = evaluate_buy_signal(metrics, available_cash)
+                    strategy, amount, reasoning = evaluate_buy_signal(
+                        metrics, available_cash, min_alloc, max_alloc, alloc_pct, rsi_lower
+                    )
                     if strategy:
                         logger.info(f"{CLR_BOLD}{CLR_GREEN}🟢 BUY Signal [{ticker}]:{CLR_RESET} {strategy} @ ₹{amount:,.2f}")
                         send_investment_suggestion(
@@ -292,11 +290,11 @@ def run_pipeline():
         logger.info(f"{CLR_BOLD}{CLR_YELLOW}Market is CLOSED.{CLR_RESET} Skipping real-time market scan.")
 
     # 3. Google Sheets Sync
-    if CREDENTIALS_FILE.exists() and SPREADSHEET_ID:
+    if credentials_file.exists() and spreadsheet_id:
         try:
             sync_dashboard_data(
-                credentials_path=str(CREDENTIALS_FILE),
-                spreadsheet_id=SPREADSHEET_ID,
+                credentials_path=str(credentials_file),
+                spreadsheet_id=spreadsheet_id,
                 processed_data=processed_rows,
                 raw_data=raw_data,
                 real_portfolio=real_portfolio,
@@ -308,8 +306,8 @@ def run_pipeline():
             logger.error(f"Google Sheets sync error: {e}")
 
     # 4. Scheduled Email Check
-    if should_trigger_mail() and not state.get("mail_sent_for_period", False):
-        logger.info(f"{CLR_BOLD}{CLR_CYAN}Triggering [{MAILER_TIME_MODE}] Mailer Report...{CLR_RESET}")
+    if should_trigger_mail(mailer_mode) and not state.get("mail_sent_for_period", False):
+        logger.info(f"{CLR_BOLD}{CLR_CYAN}Triggering [{mailer_mode}] Mailer Report...{CLR_RESET}")
         sent = send_eod_email_report(
             start_cash=state["start_cash"],
             end_cash=available_cash,
@@ -322,22 +320,27 @@ def run_pipeline():
     return market_active
 
 if __name__ == "__main__":
-    cycle_min = max(3, env_cycle_buffer)
     logger.info(f"{CLR_BOLD}{CLR_MAGENTA}=== Starting ASTRA Engine ==={CLR_RESET}")
-    logger.info(
-        f"Mode: {CLR_BOLD}{MAILER_TIME_MODE}{CLR_RESET} | "
-        f"Active Cycle: {CLR_BOLD}{cycle_min}m{CLR_RESET} | "
-        f"Off-market Cycle: {CLR_BOLD}15m{CLR_RESET} | "
-        f"Tickers Count: {CLR_BOLD}{TICKERS_COUNT}{CLR_RESET}"
-    )
     
+    # Option: Launch Telegram Bot in background thread if supported
+    if "run_telegram_bot_loop" in globals():
+        bot_thread = threading.Thread(target=run_telegram_bot_loop, daemon=True)
+        bot_thread.start()
+        logger.info("Telegram Interactive Bot Listener initialized in background.")
+
     try:
         while True:
+            # Re-read buffer on every iteration
+            load_dotenv(BASE_DIR / ".env", override=True)
+            env_cycle_buffer = int(os.getenv("ASTRA_CYCLE_BUFFER", 5))
+            live_loop_interval = max(3, env_cycle_buffer) * 60
+            closed_loop_interval = 15 * 60
+
             start_time = time.time()
             market_active = run_pipeline()
             
             elapsed = time.time() - start_time
-            target_interval = LIVE_LOOP_INTERVAL if market_active else CLOSED_LOOP_INTERVAL
+            target_interval = live_loop_interval if market_active else closed_loop_interval
             sleep_duration = max(0, target_interval - elapsed)
             
             sleep_mins = int(sleep_duration // 60)
