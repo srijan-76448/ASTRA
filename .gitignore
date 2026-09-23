@@ -1,0 +1,17 @@
+# Virtual Environment & Cache
+bin/
+lib/
+lib64
+include/
+pyvenv.cfg
+__pycache__/
+*.pyc
+
+# Environment Secrets & Service Accounts
+.env
+*.json
+!OpenAPIScripMaster.json
+
+# Logs
+logs/
+*.log
