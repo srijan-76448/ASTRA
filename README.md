@@ -174,7 +174,7 @@ source bin/activate
 ### Step 2: Install Dependencies
 
 ```bash
-pip install yfinance pandas numpy gspread google-auth smartapi-python pyotp python-dotenv requests logzero
+pip install -r requirements.txt
 
 ```
 
