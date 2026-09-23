@@ -104,8 +104,8 @@ ANGEL_TOTP_SECRET=your_base32_totp_secret
 # ==========================================
 # TELEGRAM BOT CONFIGURATION
 # ==========================================
-TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyZ
-TELEGRAM_CHAT_ID=987654321
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_telegram_chat_id
 
 # ==========================================
 # GOOGLE SHEETS TELEMETRY
@@ -127,7 +127,7 @@ MAILER_TIME=EOD   # Options: EOD, EOW, EOM
 # RISK MANAGEMENT & CAPITAL BOUNDS
 # ==========================================
 MIN_TRADE_ALLOCATION=100.0       # Lower price bound (INR)
-MAX_TRADE_ALLOCATION=500.0       # Upper price bound (INR)
+MAX_TRADE_ALLOCATION=2000.0       # Upper price bound (INR)
 PORTFOLIO_ALLOCATION_PCT=0.10    # Allocate 10% of available cash per trade
 RSI_LOWER_THRESHOLD=35.0         # Oversold threshold
 RSI_UPPER_THRESHOLD=65.0         # Overbought threshold
