@@ -30,8 +30,19 @@ ALERT_COOLDOWN_SECONDS = 6 * 3600  # 6 Hours
 
 logger = logging.getLogger("ASTRA_TELEGRAM")
 
-# Global suspension state flag
+# Global states
 IS_SUSPENDED = False
+ACTIVE_SMART_CLIENT = None
+
+
+def set_smart_client(client_instance):
+    """
+    Registers the authenticated AngelOneClient instance initialized in main.py
+    so Telegram handlers can reuse the existing SmartAPI session.
+    """
+    global ACTIVE_SMART_CLIENT
+    ACTIVE_SMART_CLIENT = client_instance
+    logger.info("Successfully registered active SmartAPI client with Telegram module.")
 
 
 def init_env_backup():
@@ -388,24 +399,33 @@ async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetches and displays live portfolio state directly from SmartAPI."""
+    """Fetches and displays live portfolio state directly from SmartAPI client."""
     if IS_SUSPENDED:
         return
 
     await update.message.reply_text("🔄 <i>Fetching live portfolio telemetry...</i>", parse_mode="HTML")
 
     try:
-        # Import your initialized SmartAPI client/wrapper instance here
-        from broker_connector import get_smart_api_instance  # Adjust import path to match your structure
-        smart_api = get_smart_api_instance()
+        global ACTIVE_SMART_CLIENT
+        client = ACTIVE_SMART_CLIENT
 
-        if not smart_api:
-            await update.message.reply_text("❌ Failed to connect to Angel One API.", parse_mode="HTML")
+        # Fallback initialization if set_smart_client was not invoked from main.py
+        if not client:
+            from smartapi import AngelOneClient
+            client = AngelOneClient()
+            if hasattr(client, "authenticate") and callable(client.authenticate):
+                client.authenticate()
+            elif hasattr(client, "login") and callable(client.login):
+                client.login()
+
+        # Check for active underlying smart_api session handle
+        smart_api_handle = getattr(client, "smart_api", client)
+        if not smart_api_handle or not hasattr(smart_api_handle, "holding"):
+            await update.message.reply_text("❌ Failed to authenticate with Angel One API.", parse_mode="HTML")
             return
 
-        # Fetch live holdings and RMS limits
-        holdings_res = smart_api.holding()
-        rms_res = smart_api.rmsLimit()
+        holdings_res = smart_api_handle.holding()
+        rms_res = smart_api_handle.rmsLimit()
 
         total_invested = 0.0
         total_current = 0.0
@@ -438,14 +458,12 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0.0
         pnl_overall_icon = "🟢" if total_pnl >= 0 else "🔴"
 
-        # Fetch available demat funds
         available_cash = 0.0
         if rms_res and rms_res.get("status") and rms_res.get("data"):
             available_cash = float(rms_res["data"].get("net", 0.0))
 
-        # Format output message
         holdings_str = "\n".join(holding_details) if holding_details else "<i>No active holdings.</i>"
-        
+
         msg = (
             "<b>📊 LIVE PORTFOLIO TELEMETRY</b>\n"
             "-------------------------------------\n"

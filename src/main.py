@@ -147,6 +147,19 @@ def clean_ticker_for_yfinance(symbol: str) -> str:
     s = symbol.replace("-EQ", "").replace("-BE", "").strip()
     return s if s.endswith(".NS") else f"{s}.NS"
 
+def extract_ticker_df(data, ticker, is_multi):
+    """Extracts clean single-ticker DataFrame from yfinance batch response."""
+    try:
+        if is_multi:
+            if ticker in data.columns.levels[0]:
+                df = data[ticker].dropna()
+                return df
+            return None
+        else:
+            return data.dropna()
+    except Exception:
+        return None
+
 def run_pipeline(force_email_now=False):
     # Load environment variables dynamically on each run
     load_dotenv(BASE_DIR / ".env", override=True)
@@ -169,15 +182,20 @@ def run_pipeline(force_email_now=False):
 
     market_active = is_market_open()
 
-    process_telegram_commands()
+    if "process_telegram_commands" in globals():
+        process_telegram_commands()
 
     # Dynamic API fetch from Angel One
     logger.info("Authenticating with Angel One SmartAPI to fetch dynamic portfolio...")
-    angel_client = AngelOneClient()
-    real_portfolio = angel_client.get_real_portfolio_data()
+    real_portfolio = {}
+    try:
+        angel_client = AngelOneClient()
+        real_portfolio = angel_client.get_real_portfolio_data() or {}
+    except Exception as e:
+        logger.error(f"Error fetching portfolio from Angel One: {e}")
 
-    available_cash = real_portfolio.get("available_cash", 0.0) if real_portfolio else 0.0
-    holdings = real_portfolio.get("holdings", []) if real_portfolio else []
+    available_cash = real_portfolio.get("available_cash", 0.0)
+    holdings = real_portfolio.get("holdings", [])
 
     logger.info(f"Available Demat Capital: ₹{available_cash:,.2f} | Active Holdings: {len(holdings)}")
 
@@ -189,16 +207,19 @@ def run_pipeline(force_email_now=False):
         # 1. EVALUATE SELL SIGNALS FOR ACTIVE HOLDINGS
         if holdings:
             logger.info("Scanning active Angel One holdings for SELL triggers...")
-            holding_tickers = [clean_ticker_for_yfinance(h["ticker"]) for h in holdings if h.get("ticker")]
+            holding_tickers = list(set([clean_ticker_for_yfinance(h["ticker"]) for h in holdings if h.get("ticker")]))
             
             if holding_tickers:
-                h_data = yf.download(holding_tickers, period="6mo", group_by="ticker", progress=False)
-                for h in holdings:
-                    t_raw = h.get("ticker", "")
-                    t_yf = clean_ticker_for_yfinance(t_raw)
-                    try:
-                        df_h = h_data[t_yf].dropna() if len(holding_tickers) > 1 else h_data.dropna()
-                        if not df_h.empty:
+                try:
+                    h_data = yf.download(holding_tickers, period="6mo", group_by="ticker", progress=False)
+                    is_multi_h = len(holding_tickers) > 1
+
+                    for h in holdings:
+                        t_raw = h.get("ticker", "")
+                        t_yf = clean_ticker_for_yfinance(t_raw)
+                        df_h = extract_ticker_df(h_data, t_yf, is_multi_h)
+
+                        if df_h is not None and not df_h.empty:
                             h_metrics = analyze_ticker_data(df_h)
                             if h_metrics:
                                 sell_action, sell_reasoning = evaluate_sell_signal(h, h_metrics, rsi_upper)
@@ -211,49 +232,60 @@ def run_pipeline(force_email_now=False):
                                         current_price=h_metrics.get("price", 0.0),
                                         reasoning=sell_reasoning
                                     )
-                    except Exception as e:
-                        logger.error(f"Error evaluating holding {t_raw}: {e}")
+                except Exception as e:
+                    logger.error(f"Error evaluating holdings batch: {e}")
 
         # 2. SCAN NSE MARKET FOR BUY SIGNALS
-        tickers = get_dynamic_tickers(tickers_count) if 'tickers_count' in str(get_dynamic_tickers.__code__.co_varnames) else get_dynamic_tickers()
+        try:
+            import inspect
+            sig = inspect.signature(get_dynamic_tickers)
+            tickers = get_dynamic_tickers(tickers_count) if "count" in sig.parameters or "limit" in sig.parameters else get_dynamic_tickers()
+        except Exception:
+            tickers = get_dynamic_tickers()
+
         logger.info(f"{CLR_BOLD}{CLR_GREEN}Market is LIVE.{CLR_RESET} Sweeping {len(tickers)} market tickers...")
         
         if tickers:
-            data = yf.download(tickers, period="6mo", group_by="ticker", progress=False)
+            try:
+                data = yf.download(tickers, period="6mo", group_by="ticker", progress=False)
+                is_multi_m = len(tickers) > 1
 
-            for ticker in tickers:
-                try:
-                    df = data[ticker].dropna() if len(tickers) > 1 else data.dropna()
-                    if df.empty:
-                        continue
-                    
-                    metrics = analyze_ticker_data(df)
-                    if not metrics:
-                        continue
+                for ticker in tickers:
+                    try:
+                        df = extract_ticker_df(data, ticker, is_multi_m)
+                        if df is None or df.empty:
+                            continue
                         
-                    scan_results[ticker] = metrics
-                    price = metrics["price"]
+                        metrics = analyze_ticker_data(df)
+                        if not metrics:
+                            continue
+                            
+                        scan_results[ticker] = metrics
+                        price = metrics["price"]
 
-                    strategy, amount, reasoning = evaluate_buy_signal(
-                        metrics, available_cash, min_alloc, max_alloc, alloc_pct, rsi_lower
-                    )
-                    if strategy:
-                        logger.info(f"{CLR_BOLD}{CLR_GREEN}🟢 BUY Signal [{ticker}]:{CLR_RESET} {strategy} @ ₹{amount:,.2f}")
-                        send_investment_suggestion(
-                            ticker=ticker,
-                            strategy=strategy,
-                            amount=amount,
-                            current_price=price,
-                            reasoning=reasoning
+                        strategy, amount, reasoning = evaluate_buy_signal(
+                            metrics, available_cash, min_alloc, max_alloc, alloc_pct, rsi_lower
                         )
+                        if strategy:
+                            logger.info(f"{CLR_BOLD}{CLR_GREEN}🟢 BUY Signal [{ticker}]:{CLR_RESET} {strategy} @ ₹{amount:,.2f}")
+                            send_investment_suggestion(
+                                ticker=ticker,
+                                strategy=strategy,
+                                amount=amount,
+                                current_price=price,
+                                reasoning=reasoning
+                            )
 
-                except Exception as e:
-                    logger.error(f"Error processing {ticker}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error processing {ticker}: {e}")
 
-            for t, m in scan_results.items():
-                sig_str = ", ".join(m.get("signals", [])) if m.get("signals") else "NEUTRAL"
-                processed_rows.append([t, m.get("price", 0.0), m.get("rsi", 0.0), m.get("macd", 0.0), sig_str])
-                raw_data.append({"ticker": t, **m})
+                for t, m in scan_results.items():
+                    sig_str = ", ".join(m.get("signals", [])) if m.get("signals") else "NEUTRAL"
+                    processed_rows.append([t, m.get("price", 0.0), m.get("rsi", 0.0), m.get("macd", 0.0), sig_str])
+                    raw_data.append({"ticker": t, **m})
+
+            except Exception as e:
+                logger.error(f"Error during market scan download: {e}")
 
     else:
         logger.info(f"{CLR_BOLD}{CLR_YELLOW}Market is CLOSED.{CLR_RESET} Skipping real-time market scan.")
@@ -277,11 +309,14 @@ def run_pipeline(force_email_now=False):
     # 4. EMAIL REPORT DISPATCH
     if should_trigger_mail(mailer_mode):
         logger.info(f"{CLR_BOLD}{CLR_CYAN}Sending Email Report (Trigger Mode: {mailer_mode})...{CLR_RESET}")
-        send_eod_email_report(
-            start_cash=available_cash,
-            end_cash=available_cash,
-            transactions=[]
-        )
+        try:
+            send_eod_email_report(
+                start_cash=available_cash,
+                end_cash=available_cash,
+                transactions=[]
+            )
+        except Exception as e:
+            logger.error(f"Error sending email report: {e}")
 
     return market_active
 
