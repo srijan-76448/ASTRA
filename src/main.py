@@ -9,9 +9,11 @@ from pathlib import Path
 import yfinance as yf
 from dotenv import load_dotenv
 
+
 # Path Setup
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR / "src"))
+
 
 # Internal Modules
 from decision_engine import analyze_ticker_data
@@ -20,6 +22,7 @@ from mailer import send_eod_email_report
 from tickers import get_dynamic_tickers
 from smartapi import AngelOneClient
 from telegram_bot import send_investment_suggestion, process_telegram_commands, run_telegram_bot_loop
+
 
 # Terminal ANSI Color Codes
 CLR_RESET = "\033[0m"
@@ -30,6 +33,10 @@ CLR_YELLOW = "\033[93m"
 CLR_BLUE = "\033[94m"
 CLR_MAGENTA = "\033[95m"
 CLR_CYAN = "\033[96m"
+
+# State tracking file for EOD emails
+EOD_STATE_FILE = BASE_DIR / "logs" / "last_eod_sent.txt"
+
 
 class ColoredFormatter(logging.Formatter):
     FORMATS = {
@@ -45,11 +52,13 @@ class ColoredFormatter(logging.Formatter):
         formatter = logging.Formatter(log_fmt, datefmt="%H:%M:%S")
         return formatter.format(record)
 
+
 handler = logging.StreamHandler()
 handler.setFormatter(ColoredFormatter())
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
+
 
 def is_market_open():
     now = datetime.datetime.now()
@@ -59,32 +68,60 @@ def is_market_open():
     market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_start <= now <= market_end
 
+def mark_eod_mail_sent():
+    """Persists today's date to disk to prevent duplicate email dispatches."""
+    today_str = datetime.date.today().isoformat()
+    try:
+        EOD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(EOD_STATE_FILE, "w") as f:
+            f.write(today_str)
+    except Exception as e:
+        logger.error(f"Failed to record EOD email state: {e}")
+
+
 def should_trigger_mail(mailer_mode):
     """Determines whether EOD / EOW / EOM or Debug (NOW) email report should be sent."""
     now = datetime.datetime.now()
     
-    # Debugging trigger: bypasses all time checks
+    # Debugging trigger: bypasses all time & state checks
     if mailer_mode == "NOW":
         return True
 
+    # Do not trigger before market closing cutoff (15:30 IST)
     eod_cutoff = now.replace(hour=15, minute=30, second=0, microsecond=0)
     if now < eod_cutoff:
         return False
 
+    # Check if EOD email has already been sent today
+    today_str = datetime.date.today().isoformat()
+    if EOD_STATE_FILE.exists():
+        try:
+            with open(EOD_STATE_FILE, "r") as f:
+                last_sent_date = f.read().strip()
+                if last_sent_date == today_str:
+                    logger.info("EOD email report already dispatched for today. Skipping.")
+                    return False
+        except Exception as e:
+            logger.warning(f"Could not read EOD state file: {e}")
+
     if mailer_mode == "EOD":
         return True
+
     elif mailer_mode == "EOW":
         return now.weekday() == 4
+
     elif mailer_mode == "EOM":
         tomorrow = now + datetime.timedelta(days=1)
         return tomorrow.day == 1
 
     return False
 
+
 def calculate_dynamic_allocation(available_cash, alloc_pct, min_alloc, max_alloc):
     calculated = available_cash * alloc_pct
     allocation = max(min_alloc, min(calculated, max_alloc))
     return min(allocation, available_cash)
+
 
 def evaluate_buy_signal(metrics, available_cash, min_alloc, max_alloc, alloc_pct, rsi_lower):
     """Evaluates BUY signals against dynamically loaded bounds."""
@@ -121,6 +158,7 @@ def evaluate_buy_signal(metrics, available_cash, min_alloc, max_alloc, alloc_pct
 
     return None, 0.0, ""
 
+
 def evaluate_sell_signal(holding, metrics, rsi_upper):
     """Evaluates SELL signals for active holdings in your Angel One portfolio."""
     avg_price = holding.get("avg_price", 0.0)
@@ -143,9 +181,11 @@ def evaluate_sell_signal(holding, metrics, rsi_upper):
 
     return None, ""
 
+
 def clean_ticker_for_yfinance(symbol: str) -> str:
     s = symbol.replace("-EQ", "").replace("-BE", "").strip()
     return s if s.endswith(".NS") else f"{s}.NS"
+
 
 def extract_ticker_df(data, ticker, is_multi):
     """Extracts clean single-ticker DataFrame from yfinance batch response."""
@@ -153,12 +193,16 @@ def extract_ticker_df(data, ticker, is_multi):
         if is_multi:
             if ticker in data.columns.levels[0]:
                 df = data[ticker].dropna()
-                return df
+                # Ensure 'Close' exists in the extracted DataFrame
+                if "Close" in df.columns:
+                    return df
             return None
         else:
-            return data.dropna()
+            df = data.dropna()
+            return df if "Close" in df.columns else None
     except Exception:
         return None
+
 
 def run_pipeline(force_email_now=False):
     # Load environment variables dynamically on each run
@@ -224,7 +268,7 @@ def run_pipeline(force_email_now=False):
                             if h_metrics:
                                 sell_action, sell_reasoning = evaluate_sell_signal(h, h_metrics, rsi_upper)
                                 if sell_action:
-                                    logger.info(f"{CLR_BOLD}{CLR_RED}🔴 SELL Signal [{t_raw}]:{CLR_RESET} {sell_action}")
+                                    logger.info(f"{CLR_BOLD}{CLR_RED}🔻 SELL Signal [{t_raw}]:{CLR_RESET} {sell_action}")
                                     send_investment_suggestion(
                                         ticker=t_raw,
                                         strategy=sell_action,
@@ -315,10 +359,14 @@ def run_pipeline(force_email_now=False):
                 end_cash=available_cash,
                 transactions=[]
             )
+            # Record that the email was successfully sent for today (unless forced using --email-now)
+            if mailer_mode != "NOW":
+                mark_eod_mail_sent()
         except Exception as e:
             logger.error(f"Error sending email report: {e}")
 
     return market_active
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASTRA Algorithmic Trading Engine")

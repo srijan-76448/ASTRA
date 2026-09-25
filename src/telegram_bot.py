@@ -17,6 +17,9 @@ from telegram.ext import (
     filters,
 )
 
+# Import the gold fetching logic directly from gold.py
+from gold import fetch_gold_data, format_gold_message
+
 # Silence verbose HTTP requests from internal polling engines
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -197,7 +200,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/set KEY VALUE</code> - Set or overwrite any .env variable\n"
         "<code>/restore_default</code> or <code>/restore</code> - Restore .env from .env.bak\n"
         "<code>/suspend DURATION</code> - Pause system (e.g., <code>/suspend 5m</code> or <code>/suspend 2h</code>)\n"
-        "<code>/portfolio</code> - Output portfolio state\n\n"
+        "<code>/portfolio</code> - Output portfolio state\n"
         "<i>Examples:</i>\n"
         "• <code>/set MIN_TRADE_ALLOCATION 200</code>\n"
         "• <code>/suspend 30m</code>"
@@ -409,7 +412,6 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global ACTIVE_SMART_CLIENT
         client = ACTIVE_SMART_CLIENT
 
-        # Fallback initialization if set_smart_client was not invoked from main.py
         if not client:
             from smartapi import AngelOneClient
             client = AngelOneClient()
@@ -418,7 +420,6 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif hasattr(client, "login") and callable(client.login):
                 client.login()
 
-        # Check for active underlying smart_api session handle
         smart_api_handle = getattr(client, "smart_api", client)
         if not smart_api_handle or not hasattr(smart_api_handle, "holding"):
             await update.message.reply_text("❌ Failed to authenticate with Angel One API.", parse_mode="HTML")
@@ -487,6 +488,43 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Executes gold data fetch via gold.py and outputs formatted response to chat."""
+    if IS_SUSPENDED:
+        return
+
+    await update.message.reply_text("👑 <i>Fetching live Gold & Precious Metals telemetry...</i>", parse_mode="HTML")
+
+    try:
+        global ACTIVE_SMART_CLIENT
+        client = ACTIVE_SMART_CLIENT
+
+        if not client:
+            try:
+                from smartapi import AngelOneClient
+                client = AngelOneClient()
+                if hasattr(client, "authenticate") and callable(client.authenticate):
+                    client.authenticate()
+                elif hasattr(client, "login") and callable(client.login):
+                    client.login()
+            except Exception as ex:
+                logger.warning(f"Could not initialize SmartAPI client in cmd_gold: {ex}")
+
+        # Call gold.py to fetch data and format output
+        gold_data = fetch_gold_data(smart_client=client)
+        msg = format_gold_message(gold_data)
+
+        logger.info("Successfully fetched gold telemetry via gold.py module.")
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Failed to fetch gold pricing telemetry via gold.py: {e}")
+        await update.message.reply_text(
+            f"❌ <b>Error fetching gold telemetry:</b> <code>{str(e)}</code>",
+            parse_mode="HTML"
+        )
+
+
 async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fallback handler for unrecognized text inputs."""
     if IS_SUSPENDED:
@@ -521,6 +559,7 @@ def run_telegram_bot_loop():
     app.add_handler(CommandHandler(["restore_default", "restore"], cmd_restore_default))
     app.add_handler(CommandHandler("suspend", cmd_suspend))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("gold", cmd_gold))
 
     # Fallback handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_text))
