@@ -177,11 +177,14 @@ To allow ASTRA to read/write performance dashboards without manual authorization
 
 ## 5. Setup & Usage Instructions
 
-### Step 1: Virtual Environment Creation (Arch Linux)
+### Step 1: Git clone and Virtual Environment Creation
 
 ```bash
+# Clone this repository
+git clone https://github.com/srijan-76448/ASTRA
+
 # Clone or navigate to the repository
-cd ~/Desktop/Projects/ASTRA
+cd ASTRA
 
 # Create isolated Python virtual environment
 python3 -m venv .
