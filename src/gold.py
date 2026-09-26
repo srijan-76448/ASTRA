@@ -2,6 +2,7 @@ import logging
 import urllib.request
 import json
 from typing import Dict, Any
+from telegram_bot import send_critical_failure_alert
 
 logger = logging.getLogger("ASTRA_GOLD")
 
@@ -85,7 +86,9 @@ def fetch_gold_data(smart_client=None) -> Dict[str, Any]:
                     if silver_res and silver_res.get("status") and silver_res.get("data"):
                         silver_ltp = float(silver_res["data"].get("ltp", 0.0))
         except Exception as e:
-            logger.warning(f"Failed to fetch live MCX telemetry via SmartAPI: {e}")
+            err_msg = f"Failed to fetch live MCX telemetry via SmartAPI: {e}"
+            logger.warning(err_msg)
+            send_critical_failure_alert(err_msg)
 
     # Baseline/Fallback values if feeds are off-market or invalid
     if gold_ltp <= 0:

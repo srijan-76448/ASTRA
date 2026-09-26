@@ -21,7 +21,8 @@ from portfolio_fetcher import sync_dashboard_data
 from mailer import send_eod_email_report
 from tickers import get_dynamic_tickers
 from smartapi import AngelOneClient
-from telegram_bot import send_investment_suggestion, process_telegram_commands, run_telegram_bot_loop
+from telegram_bot import set_smart_client, send_investment_suggestion, process_telegram_commands, run_telegram_bot_loop, send_critical_failure_alert
+from mng_db import DatabaseManager
 
 
 # Terminal ANSI Color Codes
@@ -36,6 +37,9 @@ CLR_CYAN = "\033[96m"
 
 # State tracking file for EOD emails
 EOD_STATE_FILE = BASE_DIR / "logs" / "last_eod_sent.txt"
+
+# Initialize Database Manager
+db = DatabaseManager()
 
 
 class ColoredFormatter(logging.Formatter):
@@ -234,12 +238,31 @@ def run_pipeline(force_email_now=False):
     real_portfolio = {}
     try:
         angel_client = AngelOneClient()
+        # Register client instance with Telegram bot module for auto-reauth
+        set_smart_client(angel_client)
         real_portfolio = angel_client.get_real_portfolio_data() or {}
     except Exception as e:
-        logger.error(f"Error fetching portfolio from Angel One: {e}")
+        err_msg = f"Error fetching portfolio from Angel One: {e}"
+        logger.error(err_msg)
+        send_critical_failure_alert(err_msg)
 
     available_cash = real_portfolio.get("available_cash", 0.0)
     holdings = real_portfolio.get("holdings", [])
+    
+    total_invested = sum(h.get("invested_val", 0.0) for h in holdings)
+    total_current = sum(h.get("current_val", 0.0) for h in holdings)
+    total_pnl = sum(h.get("pnl", 0.0) for h in holdings)
+
+    # Log Portfolio Snapshot in SQLite
+    try:
+        db.log_portfolio_snapshot(
+            cash=available_cash,
+            invested=total_invested,
+            current=total_current,
+            pnl=total_pnl
+        )
+    except Exception as e:
+        logger.error(f"Failed to record portfolio snapshot: {e}")
 
     logger.info(f"Available Demat Capital: ₹{available_cash:,.2f} | Active Holdings: {len(holdings)}")
 
@@ -264,7 +287,7 @@ def run_pipeline(force_email_now=False):
                         df_h = extract_ticker_df(h_data, t_yf, is_multi_h)
 
                         if df_h is not None and not df_h.empty:
-                            h_metrics = analyze_ticker_data(df_h)
+                            h_metrics = analyze_ticker_data(df_h, ticker=t_raw)
                             if h_metrics:
                                 sell_action, sell_reasoning = evaluate_sell_signal(h, h_metrics, rsi_upper)
                                 if sell_action:
@@ -300,7 +323,7 @@ def run_pipeline(force_email_now=False):
                         if df is None or df.empty:
                             continue
                         
-                        metrics = analyze_ticker_data(df)
+                        metrics = analyze_ticker_data(df, ticker=ticker)
                         if not metrics:
                             continue
                             

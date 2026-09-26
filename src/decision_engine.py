@@ -1,4 +1,9 @@
 import numpy as np
+import logging
+from mng_db import DatabaseManager
+
+logger = logging.getLogger("ASTRA_DECISION_ENGINE")
+db = DatabaseManager()
 
 def calculate_rsi(prices, period=14):
     deltas = np.diff(prices)
@@ -45,7 +50,7 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
     
     return float(macd_line[-1]), float(signal_line[-1]), float(macd_line[-2]), float(signal_line[-2])
 
-def analyze_ticker_data(df):
+def analyze_ticker_data(df, ticker: str = ""):
     closes = df['Close'].to_numpy(dtype=float).flatten()
     if len(closes) < 35:
         return None
@@ -64,6 +69,22 @@ def analyze_ticker_data(df):
         signals.append("MACD_BULLISH_CROSS")
     elif m_prev > s_prev and m_curr <= s_curr:
         signals.append("MACD_BEARISH_CROSS")
+
+    # Persist signal to database if ticker is provided and signals exist
+    if ticker and signals:
+        try:
+            for sig in signals:
+                action = "BUY" if "BULLISH" in sig or "OVERSOLD" in sig else "SELL"
+                db.log_signal(
+                    ticker=ticker,
+                    strategy=sig,
+                    price=round(current_price, 2),
+                    rsi=round(rsi_val, 2),
+                    macd=round(m_curr, 2),
+                    action=action
+                )
+        except Exception as e:
+            logger.error(f"Failed to record signal in database for {ticker}: {e}")
 
     return {
         "price": round(current_price, 2),

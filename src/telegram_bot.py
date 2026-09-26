@@ -6,7 +6,9 @@ import shutil
 import requests
 import logging
 import asyncio
+import yfinance as yf
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from dotenv import set_key, load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -17,10 +19,11 @@ from telegram.ext import (
     filters,
 )
 
-# Import the gold fetching logic directly from gold.py
+# custom modules for ASTRA
 from gold import fetch_gold_data, format_gold_message
+from mng_db import DatabaseManager
 
-# Silence verbose HTTP requests from internal polling engines
+# Silence verbose HTTP requests
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
@@ -29,9 +32,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / ".env"
 ENV_BAK_FILE = BASE_DIR / ".env.bak"
 CACHE_FILE = BASE_DIR / "alert_cache.json"
+LOG_FILE = BASE_DIR / "astra_bot.log"
 ALERT_COOLDOWN_SECONDS = 6 * 3600  # 6 Hours
 
+# Configure Rotating File Logger
 logger = logging.getLogger("ASTRA_TELEGRAM")
+logger.setLevel(logging.INFO)
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s")
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Initialize Database Instance
+db = DatabaseManager()
 
 # Global states
 IS_SUSPENDED = False
@@ -46,6 +59,42 @@ def set_smart_client(client_instance):
     global ACTIVE_SMART_CLIENT
     ACTIVE_SMART_CLIENT = client_instance
     logger.info("Successfully registered active SmartAPI client with Telegram module.")
+
+
+def get_active_smart_client():
+    """
+    Auto-reauthentication Middleware: Validates existing session and automatically 
+    re-authenticates if session state is expired or invalidated.
+    """
+    global ACTIVE_SMART_CLIENT
+    client = ACTIVE_SMART_CLIENT
+
+    if not client:
+        try:
+            from smartapi import AngelOneClient
+            client = AngelOneClient()
+            if hasattr(client, "authenticate") and callable(client.authenticate):
+                client.authenticate()
+            elif hasattr(client, "login") and callable(client.login):
+                client.login()
+            ACTIVE_SMART_CLIENT = client
+        except Exception as e:
+            logger.error(f"Auto-Reauthentication failed: {e}")
+            send_critical_failure_alert(f"SmartAPI Auto-Reauthentication Failure: {e}")
+            return None
+
+    return client
+
+
+def send_critical_failure_alert(error_msg: str):
+    """Dispatches emergency notification to Telegram in case of system lockouts or uncaught errors."""
+    msg = (
+        "<b>🚨 ASTRA CRITICAL ENGINE ALERT</b>\n\n"
+        f"• <b>Error:</b> <code>{error_msg}</code>\n"
+        "• <b>Impact:</b> Automated execution interrupted.\n"
+        "• <b>Action Required:</b> Inspect system logs immediately."
+    )
+    send_telegram_message(msg)
 
 
 def init_env_backup():
@@ -122,7 +171,7 @@ def send_telegram_message(message_html: str):
 
 
 def send_investment_suggestion(ticker: str, strategy: str, amount: float, current_price: float, reasoning: str):
-    """Dispatches alerts with persistent 6-hour disk-backed duplicate suppression."""
+    """Dispatches alerts with persistent 6-hour disk-backed duplicate suppression and SQLite logging."""
     if IS_SUSPENDED:
         return
 
@@ -150,24 +199,30 @@ def send_investment_suggestion(ticker: str, strategy: str, amount: float, curren
         save_alert_cache(cache)
         return
 
-    emoji = "🔴" if "SELL" in strategy else "🟢"
+    # Strictly output BUY or SELL signal
+    action_clean = "SELL" if "SELL" in strategy.upper() else "BUY"
+    emoji = "🔴" if action_clean == "SELL" else "🟢"
+
+    # Calculate Stop Loss and Target Price
+    tsl = current_price * 0.98 if action_clean == "BUY" else current_price * 1.02
+    tp = current_price * 1.05 if action_clean == "BUY" else current_price * 0.95
+
     msg = (
         f"<b>{emoji} ASTRA TELEMETRY ALERT: {ticker}</b>\n\n"
-        f"• <b>Action:</b> <code>{strategy}</code>\n"
+        f"• <b>Action:</b> <code>{action_clean}</code>\n"
         f"• <b>Live Price:</b> ₹{current_price:,.2f}\n"
+        f"• <b>Stop Loss (TSL -2%):</b> ₹{tsl:,.2f}\n"
+        f"• <b>Target Price (TP +5%):</b> ₹{tp:,.2f}\n"
         f"• <b>Allocated Amount:</b> ₹{amount:,.2f}\n"
         f"• <b>Technical Reasoning:</b> {reasoning}\n"
     )
 
     send_telegram_message(msg)
 
+    # Persist in cache and database
     cache[cache_key] = current_time
     save_alert_cache(cache)
-
-
-def process_telegram_commands():
-    """Legacy interface for external loop integration."""
-    pass
+    db.log_signal(ticker, strategy, current_price, 0.0, 0.0, action_clean)
 
 
 # ==========================================================
@@ -201,8 +256,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/restore_default</code> or <code>/restore</code> - Restore .env from .env.bak\n"
         "<code>/suspend DURATION</code> - Pause system (e.g., <code>/suspend 5m</code> or <code>/suspend 2h</code>)\n"
         "<code>/portfolio</code> - Output portfolio state\n"
+        "<code>/analyze SYMBOL</code> - Instant stock technical analysis\n\n"
         "<i>Examples:</i>\n"
-        "• <code>/set MIN_TRADE_ALLOCATION 200</code>\n"
+        "• <code>/analyze TATAMOTORS</code>\n"
         "• <code>/suspend 30m</code>"
     )
     await update.message.reply_text(help_text, parse_mode="HTML")
@@ -402,29 +458,19 @@ async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetches and displays live portfolio state directly from SmartAPI client."""
+    """Fetches and displays live portfolio state directly from SmartAPI client using middleware auto-reauth."""
     if IS_SUSPENDED:
         return
 
     await update.message.reply_text("🔄 <i>Fetching live portfolio telemetry...</i>", parse_mode="HTML")
 
     try:
-        global ACTIVE_SMART_CLIENT
-        client = ACTIVE_SMART_CLIENT
-
+        client = get_active_smart_client()
         if not client:
-            from smartapi import AngelOneClient
-            client = AngelOneClient()
-            if hasattr(client, "authenticate") and callable(client.authenticate):
-                client.authenticate()
-            elif hasattr(client, "login") and callable(client.login):
-                client.login()
-
-        smart_api_handle = getattr(client, "smart_api", client)
-        if not smart_api_handle or not hasattr(smart_api_handle, "holding"):
             await update.message.reply_text("❌ Failed to authenticate with Angel One API.", parse_mode="HTML")
             return
 
+        smart_api_handle = getattr(client, "smart_api", client)
         holdings_res = smart_api_handle.holding()
         rms_res = smart_api_handle.rmsLimit()
 
@@ -463,6 +509,9 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rms_res and rms_res.get("status") and rms_res.get("data"):
             available_cash = float(rms_res["data"].get("net", 0.0))
 
+        # Log portfolio snapshot to SQLite
+        db.log_portfolio_snapshot(available_cash, total_invested, total_current, total_pnl)
+
         holdings_str = "\n".join(holding_details) if holding_details else "<i>No active holdings.</i>"
 
         msg = (
@@ -482,6 +531,7 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Failed to pull live portfolio for Telegram: {e}")
+        send_critical_failure_alert(f"Portfolio Fetch Exception: {e}")
         await update.message.reply_text(
             f"❌ <b>Error pulling live portfolio:</b> <code>{str(e)}</code>",
             parse_mode="HTML"
@@ -496,21 +546,7 @@ async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👑 <i>Fetching live Gold & Precious Metals telemetry...</i>", parse_mode="HTML")
 
     try:
-        global ACTIVE_SMART_CLIENT
-        client = ACTIVE_SMART_CLIENT
-
-        if not client:
-            try:
-                from smartapi import AngelOneClient
-                client = AngelOneClient()
-                if hasattr(client, "authenticate") and callable(client.authenticate):
-                    client.authenticate()
-                elif hasattr(client, "login") and callable(client.login):
-                    client.login()
-            except Exception as ex:
-                logger.warning(f"Could not initialize SmartAPI client in cmd_gold: {ex}")
-
-        # Call gold.py to fetch data and format output
+        client = get_active_smart_client()
         gold_data = fetch_gold_data(smart_client=client)
         msg = format_gold_message(gold_data)
 
@@ -521,6 +557,97 @@ async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to fetch gold pricing telemetry via gold.py: {e}")
         await update.message.reply_text(
             f"❌ <b>Error fetching gold telemetry:</b> <code>{str(e)}</code>",
+            parse_mode="HTML"
+        )
+
+
+async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetches market data for a given ticker and returns an instant technical evaluation strictly restricted to BUY or SELL with Stop Loss & TP."""
+    if IS_SUSPENDED:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "<b>Usage:</b> <code>/analyze TICKER</code> or <code>/predict TICKER</code>\n"
+            "<i>Examples:</i> <code>/analyze TATAMOTORS</code> or <code>/predict RELIANCE</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    raw_symbol = context.args[0].upper().strip()
+    clean_symbol = raw_symbol if raw_symbol.endswith(".NS") or raw_symbol.endswith(".BO") else f"{raw_symbol}.NS"
+
+    await update.message.reply_text(
+        f"🔍 <i>Analyzing market data for <b>{clean_symbol}</b>...</i>",
+        parse_mode="HTML"
+    )
+
+    try:
+        df = yf.download(clean_symbol, period="6mo", progress=False)
+        if df is None or df.empty:
+            await update.message.reply_text(
+                f"❌ Could not retrieve price data for <code>{clean_symbol}</code>. Please check ticker symbol.",
+                parse_mode="HTML"
+            )
+            return
+
+        # Flatten multi-index columns if returned by yfinance
+        if hasattr(df.columns, 'levels') and len(df.columns.levels) > 1:
+            try:
+                df = df.xs(clean_symbol, level=1, axis=1)
+            except Exception:
+                df.columns = df.columns.get_level_values(0)
+
+        from decision_engine import analyze_ticker_data
+        metrics = analyze_ticker_data(df)
+
+        if not metrics:
+            await update.message.reply_text(
+                f"⚠️ Insufficient technical data to evaluate <code>{clean_symbol}</code>.",
+                parse_mode="HTML"
+            )
+            return
+
+        price = metrics.get("price", 0.0)
+        rsi = metrics.get("rsi", 50.0)
+        macd = metrics.get("macd", 0.0)
+        signals = metrics.get("signals", [])
+        sig_str = ", ".join(signals) if signals else "NEUTRAL"
+
+        # Binary Decision Rule: BUY or SELL only
+        if rsi < 50.0 or "MACD_BULLISH_CROSS" in signals:
+            recommendation = "🟢 BUY"
+            reasoning = f"Bullish bias (RSI {rsi:.1f} &lt; 50 or MACD structure)."
+            tsl = price * 0.98
+            tp = price * 1.05
+        else:
+            recommendation = "🔴 SELL"
+            reasoning = f"Bearish / profit-taking bias (RSI {rsi:.1f} &gt;= 50 or MACD exhaustion)."
+            tsl = price * 1.02
+            tp = price * 0.95
+
+        # Persist signal in SQLite DB
+        db.log_signal(clean_symbol, recommendation, price, rsi, macd, recommendation.split()[-1])
+
+        report = (
+            f"<b>📊 TECHNICAL ANALYSIS: {clean_symbol}</b>\n\n"
+            f"• <b>Current Price:</b> ₹{price:,.2f}\n"
+            f"• <b>Stop Loss (TSL -2%):</b> ₹{tsl:,.2f}\n"
+            f"• <b>Target Price (TP +5%):</b> ₹{tp:,.2f}\n"
+            f"• <b>RSI (14):</b> {rsi:.1f}\n"
+            f"• <b>MACD Value:</b> {macd:.2f}\n"
+            f"• <b>Active Signals:</b> <code>{sig_str}</code>\n\n"
+            f"💡 <b>RECOMMENDATION:</b> <code>{recommendation}</code>\n"
+            f"📝 <b>Reasoning:</b> {reasoning}\n\n"
+            f"<i>Note: Analysis calculated independently of wallet balance.</i>"
+        )
+        await update.message.reply_text(report, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Failed to analyze stock command for {clean_symbol}: {e}")
+        send_critical_failure_alert(f"Analysis Error on {clean_symbol}: {e}")
+        await update.message.reply_text(
+            f"❌ Error analyzing <code>{clean_symbol}</code>: {str(e)}",
             parse_mode="HTML"
         )
 
@@ -560,9 +687,10 @@ def run_telegram_bot_loop():
     app.add_handler(CommandHandler("suspend", cmd_suspend))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("gold", cmd_gold))
+    app.add_handler(CommandHandler("analyze", cmd_analyze))
 
-    # Fallback handler
+    # Fallback handler for unrecognized commands
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_text))
 
-    logger.info("Telegram CLI interface running...")
-    app.run_polling(drop_pending_updates=True, close_loop=False, stop_signals=None)
+    logger.info("🤖 Telegram CLI Command Listener active and polling...")
+    app.run_polling(drop_pending_updates=True, stop_signals=None)

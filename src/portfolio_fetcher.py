@@ -93,30 +93,55 @@ def sync_dashboard_data(
 
             available_cash = real_portfolio.get("available_cash", 0.0)
             holdings = real_portfolio.get("holdings", [])
-            invested_value = sum(item["qty"] * item["avg_price"] for item in holdings)
 
             wallet_rows = [
                 ["REAL BROKER PORTFOLIO (ANGEL ONE)", ""],
                 ["Available Cash / RMS Net (INR)", available_cash],
-                ["Total Invested Capital (INR)", invested_value],
+                ["Total Active Holdings", len(holdings)],
                 [],
                 ["ACTIVE HOLDINGS"],
-                ["TICKER", "QUANTITY", "AVG PRICE (INR)", "CURRENT PRICE (INR)", "P&L (INR)"]
+                [
+                    "TICKER",
+                    "QUANTITY",
+                    "BUY PRICE (INR)",
+                    "CURRENT PRICE (INR)",
+                    "TOTAL INVESTED (INR)",
+                    "CURRENT VALUE (INR)",
+                    "P&L AMOUNT (INR)",
+                    "P&L (%)",
+                    "STATUS"
+                ]
             ]
 
             if holdings:
-                for h in holdings:
+                start_row = 7  # Table data rows start at line 7 in Sheets
+                for idx, h in enumerate(holdings, start=start_row):
+                    ticker = h.get("ticker", "")
+                    qty = h.get("qty", 0)
+                    avg_price = h.get("avg_price", 0.0)
+                    curr_price = h.get("current_price", 0.0)
+
+                    # Dynamic Formulas for Google Sheets
+                    invested_formula = f"=B{idx}*C{idx}"
+                    current_val_formula = f"=B{idx}*D{idx}"
+                    pnl_amt_formula = f"=F{idx}-E{idx}"
+                    pnl_pct_formula = f"=IF(E{idx}>0, ((F{idx}-E{idx})/E{idx})*100, 0)"
+
                     wallet_rows.append([
-                        h.get("ticker", ""),
-                        h.get("qty", 0),
-                        h.get("avg_price", 0.0),
-                        h.get("current_price", 0.0),
-                        h.get("pnl", 0.0)
+                        ticker,
+                        qty,
+                        avg_price,
+                        curr_price,
+                        invested_formula,
+                        current_val_formula,
+                        pnl_amt_formula,
+                        pnl_pct_formula,
+                        "HOLDING"
                     ])
             else:
-                wallet_rows.append(["No active holdings in Angel One account.", "", "", "", ""])
+                wallet_rows.append(["No active holdings in Angel One account.", "", "", "", "", "", "", "", ""])
 
-            wallet_ws.update(range_name="A1", values=wallet_rows)
+            wallet_ws.update(range_name="A1", values=wallet_rows, value_input_option="USER_ENTERED")
             logger.info(f"Updated tab: '{wallet_tab_name}' with real broker metrics.")
 
         except Exception as e:
