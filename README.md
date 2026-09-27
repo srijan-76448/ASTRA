@@ -1,4 +1,4 @@
-# ASTRA (Automated System for Trading Risk & Analysis)
+# ASTRA (Automated System for Trading & Risk Analysis)
 
 ASTRA is a lightweight, fully automated, local trading telemetry and alerting system engineered specifically for Indian Equity Markets (NSE). It scans budget-aligned equities in real time, evaluates technical indicators (RSI and MACD), verifies trade feasibility against live cash liquidity in Angel One, and dispatches real-time **BUY** and **SELL** alerts via Telegram while maintaining live performance dashboards in Google Sheets.
 
