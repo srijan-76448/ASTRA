@@ -7,7 +7,8 @@ from logzero import logger
 
 load_dotenv()
 
-def send_email_alert(subject: str, body: str):
+def send_email_alert(subject: str, body: str) -> bool:
+    """Dispatches email notification using SMTP configuration from .env."""
     server_host = os.getenv("SMTP_SERVER", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", 587))
     sender_email = os.getenv("SMTP_SENDER_EMAIL")
@@ -36,7 +37,7 @@ def send_email_alert(subject: str, body: str):
         logger.exception(f"Failed to send email alert: {e}")
         return False
 
-def send_eod_email_report(start_cash: float, end_cash: float, transactions: list):
+def send_eod_email_report(start_cash: float, end_cash: float, transactions: list) -> bool:
     """Generates and dispatches EOD financial summary."""
     pnl = end_cash - start_cash
     pnl_pct = (pnl / start_cash * 100) if start_cash > 0 else 0.0
@@ -57,7 +58,7 @@ def send_eod_email_report(start_cash: float, end_cash: float, transactions: list
         lines.append("• No trades or transactions executed today.")
     else:
         for tx in transactions:
-            lines.append(f"• {tx['time']} | {tx['action']} {tx['ticker']} | Qty: {tx['qty']} @ ₹{tx['price']} | Total: ₹{tx['total']}")
+            lines.append(f"• {tx.get('time', 'N/A')} | {tx.get('action', '')} {tx.get('ticker', '')} | Qty: {tx.get('qty', 0)} @ ₹{tx.get('price', 0.0)} | Total: ₹{tx.get('total', 0.0)}")
 
     body = "\n".join(lines)
     return send_email_alert(subject=f"EOD Performance Summary - Net PnL: {pnl_pct:+.2f}%", body=body)

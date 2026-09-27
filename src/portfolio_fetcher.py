@@ -3,7 +3,8 @@ import logging
 import gspread
 from google.oauth2.service_account import Credentials
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ASTRA_PORTFOLIO_FETCHER")
+
 
 def sync_dashboard_data(
     credentials_path: str,
@@ -15,10 +16,7 @@ def sync_dashboard_data(
     raw_tab_name: str = "Raw Data",
     wallet_tab_name: str = "Wallet_and_Holdings"
 ):
-    """
-    Syncs market scan analysis, raw data metrics, and live Angel One broker holdings 
-    into Google Sheets while preserving existing data during off-market hours or empty scans.
-    """
+    """Syncs market scan analysis, raw data metrics, and live Angel One broker holdings into Google Sheets."""
     if not credentials_path or not os.path.exists(credentials_path):
         logger.error(f"Credentials file missing: {credentials_path}")
         return
@@ -37,7 +35,7 @@ def sync_dashboard_data(
         logger.error(f"Failed to authorize Google Sheets API: {e}")
         return
 
-    # 1. Update 'Market Scan' Tab (Only if new processed data exists)
+    # 1. Update 'Market Scan' Tab
     if processed_data and len(processed_data) > 1:
         try:
             try:
@@ -50,10 +48,8 @@ def sync_dashboard_data(
             logger.info(f"Updated tab: '{main_tab_name}'")
         except Exception as e:
             logger.error(f"Failed updating tab '{main_tab_name}': {e}")
-    else:
-        logger.info(f"Skipped updating tab '{main_tab_name}' (Preserved existing data).")
 
-    # 2. Update 'Raw Data' Tab (Only if new raw metrics exist)
+    # 2. Update 'Raw Data' Tab
     if raw_data:
         try:
             try:
@@ -78,10 +74,8 @@ def sync_dashboard_data(
             logger.info(f"Updated tab: '{raw_tab_name}' with {len(raw_data)} records.")
         except Exception as e:
             logger.error(f"Failed updating tab '{raw_tab_name}': {e}")
-    else:
-        logger.info(f"Skipped updating tab '{raw_tab_name}' (Preserved existing data).")
 
-    # 3. Update 'Wallet_and_Holdings' Tab (Always update live broker capital/positions)
+    # 3. Update 'Wallet_and_Holdings' Tab
     if real_portfolio is not None:
         try:
             try:
@@ -114,14 +108,13 @@ def sync_dashboard_data(
             ]
 
             if holdings:
-                start_row = 7  # Table data rows start at line 7 in Sheets
+                start_row = 7
                 for idx, h in enumerate(holdings, start=start_row):
                     ticker = h.get("ticker", "")
                     qty = h.get("qty", 0)
                     avg_price = h.get("avg_price", 0.0)
                     curr_price = h.get("current_price", 0.0)
 
-                    # Dynamic Formulas for Google Sheets
                     invested_formula = f"=B{idx}*C{idx}"
                     current_val_formula = f"=B{idx}*D{idx}"
                     pnl_amt_formula = f"=F{idx}-E{idx}"
@@ -146,3 +139,26 @@ def sync_dashboard_data(
 
         except Exception as e:
             logger.error(f"Failed updating tab '{wallet_tab_name}': {e}")
+
+
+def get_cost_price_from_sheet(credentials_path: str, spreadsheet_id: str, ticker: str, tab_name: str = "Wallet_and_Holdings") -> float:
+    """
+    Reads the designated tab in Google Sheets to fetch the recorded cost price for a ticker.
+    Returns 0.0 if not found or on error.
+    """
+    try:
+        gc = gspread.service_account(filename=credentials_path)
+        sh = gc.open_by_key(spreadsheet_id)
+        worksheet = sh.worksheet(tab_name)
+        
+        records = worksheet.get_all_records()
+        for row in records:
+            # Check matching ticker column
+            if str(row.get("Ticker", "")).strip().upper() == ticker.strip().upper():
+                val = row.get("Cost Price") or row.get("Buy Price") or row.get("Avg Price")
+                if val:
+                    return float(str(val).replace("₹", "").replace(",", "").strip())
+    except Exception as e:
+        print(f"Error fetching cost price from Google Sheet for {ticker}: {e}")
+    
+    return 0.0

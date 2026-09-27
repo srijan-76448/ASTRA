@@ -19,12 +19,10 @@ from telegram.ext import (
     filters,
 )
 
-# custom modules for ASTRA
 from gold import fetch_gold_data, format_gold_message
 from mng_db import DatabaseManager
-from utils import send_critical_failure_alert
+from utils import send_critical_failure_alert, clean_ticker_symbol
 
-# Silence verbose HTTP requests
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
@@ -34,9 +32,8 @@ ENV_FILE = BASE_DIR / ".env"
 ENV_BAK_FILE = BASE_DIR / ".env.bak"
 CACHE_FILE = BASE_DIR / "alert_cache.json"
 LOG_FILE = BASE_DIR / "astra_bot.log"
-ALERT_COOLDOWN_SECONDS = 6 * 3600  # 6 Hours
+ALERT_COOLDOWN_SECONDS = 6 * 3600
 
-# Configure Rotating File Logger
 logger = logging.getLogger("ASTRA_TELEGRAM")
 logger.setLevel(logging.INFO)
 file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
@@ -44,29 +41,17 @@ formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s")
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# Initialize Database Instance
 db = DatabaseManager()
 
-# Global states
 IS_SUSPENDED = False
 ACTIVE_SMART_CLIENT = None
 
-
 def set_smart_client(client_instance):
-    """
-    Registers the authenticated AngelOneClient instance initialized in main.py
-    so Telegram handlers can reuse the existing SmartAPI session.
-    """
     global ACTIVE_SMART_CLIENT
     ACTIVE_SMART_CLIENT = client_instance
     logger.info("Successfully registered active SmartAPI client with Telegram module.")
 
-
 def get_active_smart_client():
-    """
-    Auto-reauthentication Middleware: Validates existing session and automatically 
-    re-authenticates if session state is expired or invalidated.
-    """
     global ACTIVE_SMART_CLIENT
     client = ACTIVE_SMART_CLIENT
 
@@ -76,8 +61,6 @@ def get_active_smart_client():
             client = AngelOneClient()
             if hasattr(client, "authenticate") and callable(client.authenticate):
                 client.authenticate()
-            elif hasattr(client, "login") and callable(client.login):
-                client.login()
             ACTIVE_SMART_CLIENT = client
         except Exception as e:
             logger.error(f"Auto-Reauthentication failed: {e}")
@@ -86,20 +69,7 @@ def get_active_smart_client():
 
     return client
 
-
-def send_critical_failure_alert(error_msg: str):
-    """Dispatches emergency notification to Telegram in case of system lockouts or uncaught errors."""
-    msg = (
-        "<b>🚨 ASTRA CRITICAL ENGINE ALERT</b>\n\n"
-        f"• <b>Error:</b> <code>{error_msg}</code>\n"
-        "• <b>Impact:</b> Automated execution interrupted.\n"
-        "• <b>Action Required:</b> Inspect system logs immediately."
-    )
-    send_telegram_message(msg)
-
-
 def init_env_backup():
-    """Creates a .env.bak file on initial system boot if it does not exist."""
     if ENV_FILE.exists() and not ENV_BAK_FILE.exists():
         try:
             shutil.copyfile(ENV_FILE, ENV_BAK_FILE)
@@ -107,15 +77,11 @@ def init_env_backup():
         except Exception as e:
             logger.error(f"Failed to create .env.bak: {e}")
 
-
 def get_env_val(key: str, default: str = "") -> str:
-    """Fetches raw environment variable directly from .env on disk."""
     load_dotenv(ENV_FILE, override=True)
     return os.getenv(key, default)
 
-
 def load_alert_cache() -> dict:
-    """Loads alert history from disk."""
     if CACHE_FILE.exists():
         try:
             with open(CACHE_FILE, "r") as f:
@@ -125,18 +91,14 @@ def load_alert_cache() -> dict:
             return {}
     return {}
 
-
 def save_alert_cache(cache: dict):
-    """Saves alert history to disk."""
     try:
         with open(CACHE_FILE, "w") as f:
             json.dump(cache, f, indent=2)
     except Exception as e:
         logger.error(f"Failed to write alert cache to disk: {e}")
 
-
 def parse_duration_to_seconds(duration_str: str) -> int | None:
-    """Parses time string formats such as '5m' or '2h' into seconds."""
     match = re.match(r"^(\d+)([mh])$", duration_str.lower().strip())
     if not match:
         return None
@@ -145,9 +107,7 @@ def parse_duration_to_seconds(duration_str: str) -> int | None:
     val = int(val)
     return val * 60 if unit == "m" else val * 3600
 
-
 def send_telegram_message(message_html: str):
-    """Sends a raw HTML message via Telegram Bot API (Synchronous Dispatch)."""
     if IS_SUSPENDED:
         logger.info("⏸️ Telegram bot is currently suspended. Suppressing outgoing telemetry message.")
         return
@@ -170,9 +130,7 @@ def send_telegram_message(message_html: str):
     except Exception as e:
         logger.error(f"Failed to dispatch Telegram message: {e}")
 
-
 def send_investment_suggestion(ticker: str, strategy: str, amount: float, current_price: float, reasoning: str):
-    """Dispatches alerts with persistent 6-hour disk-backed duplicate suppression and SQLite logging."""
     if IS_SUSPENDED:
         return
 
@@ -181,15 +139,10 @@ def send_investment_suggestion(ticker: str, strategy: str, amount: float, curren
 
     cache = load_alert_cache()
 
-    # Clear entries older than 6 hours
-    expired_keys = [
-        k for k, ts in cache.items()
-        if current_time - ts > ALERT_COOLDOWN_SECONDS
-    ]
+    expired_keys = [k for k, ts in cache.items() if current_time - ts > ALERT_COOLDOWN_SECONDS]
     for k in expired_keys:
         del cache[k]
 
-    # Check cooldown state
     if cache_key in cache:
         last_sent_time = cache[cache_key]
         elapsed_hours = (current_time - last_sent_time) / 3600.0
@@ -200,11 +153,9 @@ def send_investment_suggestion(ticker: str, strategy: str, amount: float, curren
         save_alert_cache(cache)
         return
 
-    # Strictly output BUY or SELL signal
     action_clean = "SELL" if "SELL" in strategy.upper() else "BUY"
     emoji = "🔴" if action_clean == "SELL" else "🟢"
 
-    # Calculate Stop Loss and Target Price
     tsl = current_price * 0.98 if action_clean == "BUY" else current_price * 1.02
     tp = current_price * 1.05 if action_clean == "BUY" else current_price * 0.95
 
@@ -220,7 +171,6 @@ def send_investment_suggestion(ticker: str, strategy: str, amount: float, curren
 
     send_telegram_message(msg)
 
-    # Persist in cache and database
     cache[cache_key] = current_time
     save_alert_cache(cache)
     db.log_signal(ticker, strategy, current_price, 0.0, 0.0, action_clean)
@@ -231,7 +181,6 @@ def send_investment_suggestion(ticker: str, strategy: str, amount: float, curren
 # ==========================================================
 
 async def cmd_resume_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Callback execution triggered automatically when suspension timer elapses."""
     global IS_SUSPENDED
     IS_SUSPENDED = False
     chat_id = context.job.chat_id
@@ -244,7 +193,6 @@ async def cmd_resume_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays available CLI text commands."""
     if IS_SUSPENDED:
         return
 
@@ -266,7 +214,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prints system status."""
     if IS_SUSPENDED:
         return
 
@@ -288,7 +235,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Returns the direct Google Sheets URL for active telemetry."""
     if IS_SUSPENDED:
         return
 
@@ -310,7 +256,6 @@ async def cmd_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dumps full .env file contents to chat with token masking."""
     if IS_SUSPENDED:
         return
 
@@ -350,9 +295,7 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to read <code>.env</code>: {str(e)}", parse_mode="HTML")
 
-
 async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Modifies environment variables directly in .env without unnecessary quotes."""
     if IS_SUSPENDED:
         return
 
@@ -384,9 +327,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-
 async def cmd_restore_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Restores default .env configuration from .env.bak."""
     if IS_SUSPENDED:
         return
 
@@ -409,9 +350,7 @@ async def cmd_restore_default(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="HTML"
         )
 
-
 async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Suspends the bot for a designated duration (e.g., 5m or 2h)."""
     global IS_SUSPENDED
 
     if not context.args:
@@ -427,8 +366,7 @@ async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if seconds is None:
         await update.message.reply_text(
-            "❌ <b>Invalid time format.</b> Use <code>m</code> for minutes or <code>h</code> for hours.\n"
-            "<i>Examples:</i> <code>5m</code>, <code>2h</code>",
+            "❌ <b>Invalid time format.</b> Use <code>m</code> for minutes or <code>h</code> for hours.",
             parse_mode="HTML"
         )
         return
@@ -457,9 +395,7 @@ async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetches and displays live portfolio state directly from SmartAPI client using middleware auto-reauth."""
     if IS_SUSPENDED:
         return
 
@@ -510,7 +446,6 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if rms_res and rms_res.get("status") and rms_res.get("data"):
             available_cash = float(rms_res["data"].get("net", 0.0))
 
-        # Log portfolio snapshot to SQLite
         db.log_portfolio_snapshot(available_cash, total_invested, total_current, total_pnl)
 
         holdings_str = "\n".join(holding_details) if holding_details else "<i>No active holdings.</i>"
@@ -538,9 +473,7 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-
 async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Executes gold data fetch via gold.py and outputs formatted response to chat."""
     if IS_SUSPENDED:
         return
 
@@ -561,9 +494,7 @@ async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetches market data for a given ticker and returns an instant technical evaluation strictly restricted to BUY or SELL with Stop Loss & TP."""
     if IS_SUSPENDED:
         return
 
@@ -576,7 +507,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     raw_symbol = context.args[0].upper().strip()
-    clean_symbol = raw_symbol if raw_symbol.endswith(".NS") or raw_symbol.endswith(".BO") else f"{raw_symbol}.NS"
+    clean_symbol = clean_ticker_symbol(raw_symbol)
 
     await update.message.reply_text(
         f"🔍 <i>Analyzing market data for <b>{clean_symbol}</b>...</i>",
@@ -592,7 +523,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Flatten multi-index columns if returned by yfinance
         if hasattr(df.columns, 'levels') and len(df.columns.levels) > 1:
             try:
                 df = df.xs(clean_symbol, level=1, axis=1)
@@ -615,7 +545,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
         signals = metrics.get("signals", [])
         sig_str = ", ".join(signals) if signals else "NEUTRAL"
 
-        # Binary Decision Rule: BUY or SELL only
         if rsi < 50.0 or "MACD_BULLISH_CROSS" in signals:
             recommendation = "🟢 BUY"
             reasoning = f"Bullish bias (RSI {rsi:.1f} &lt; 50 or MACD structure)."
@@ -627,7 +556,6 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tsl = price * 1.02
             tp = price * 0.95
 
-        # Persist signal in SQLite DB
         db.log_signal(clean_symbol, recommendation, price, rsi, macd, recommendation.split()[-1])
 
         report = (
@@ -652,9 +580,7 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-
 async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback handler for unrecognized text inputs."""
     if IS_SUSPENDED:
         return
 
@@ -663,9 +589,7 @@ async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="HTML"
     )
 
-
 def run_telegram_bot_loop():
-    """Starts the asynchronous Telegram bot listener and initializes backups."""
     init_env_backup()
 
     token = get_env_val("TELEGRAM_BOT_TOKEN")
@@ -678,7 +602,6 @@ def run_telegram_bot_loop():
 
     app = Application.builder().token(token).build()
 
-    # Terminal command routes
     app.add_handler(CommandHandler(["start", "help"], cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler(["sheet", "spreadsheet"], cmd_sheet))
@@ -690,7 +613,6 @@ def run_telegram_bot_loop():
     app.add_handler(CommandHandler("gold", cmd_gold))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
 
-    # Fallback handler for unrecognized commands
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_text))
 
     logger.info("🤖 Telegram CLI Command Listener active and polling...")

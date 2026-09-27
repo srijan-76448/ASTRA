@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger("ASTRA_DB")
 DB_PATH = Path(__file__).resolve().parent.parent / "astra.db"
@@ -62,7 +62,7 @@ class DatabaseManager:
                 cursor.execute("""
                     INSERT INTO signal_history (timestamp, ticker, strategy, price, rsi, macd, action)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (datetime.utcnow().isoformat(), ticker, strategy, price, rsi, macd, action))
+                """, (datetime.now(timezone.utc).isoformat(), ticker, strategy, price, rsi, macd, action))
                 conn.commit()
         except Exception as e:
             logger.error(f"Failed to persist signal record for {ticker}: {e}")
@@ -75,7 +75,7 @@ class DatabaseManager:
                 cursor.execute("""
                     INSERT INTO portfolio_snapshots (timestamp, available_cash, total_invested, current_value, total_pnl)
                     VALUES (?, ?, ?, ?, ?)
-                """, (datetime.utcnow().isoformat(), cash, invested, current, pnl))
+                """, (datetime.now(timezone.utc).isoformat(), cash, invested, current, pnl))
                 conn.commit()
         except Exception as e:
             logger.error(f"Failed to persist portfolio snapshot: {e}")

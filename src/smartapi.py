@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ASTRA_SMARTAPI")
 
 class AngelOneClient:
     def __init__(self):
@@ -18,7 +18,7 @@ class AngelOneClient:
         self.totp_secret = os.getenv("ANGEL_TOTP_SECRET")
         self.smart_api = None
 
-    def authenticate(self):
+    def authenticate(self) -> bool:
         """Authenticates with Angel One SmartAPI using TOTP."""
         try:
             self.smart_api = SmartConnect(api_key=self.api_key)
@@ -29,7 +29,7 @@ class AngelOneClient:
                 logger.info("Successfully authenticated with Angel One SmartAPI.")
                 return True
             else:
-                logger.error(f"Angel One Login Failed: {data.get('message')}")
+                logger.error(f"Angel One Login Failed: {data.get('message') if data else 'No response'}")
                 return False
         except Exception as e:
             logger.error(f"Error during Angel One authentication: {e}")
@@ -41,13 +41,11 @@ class AngelOneClient:
             return None
 
         try:
-            # Fetch RMS Limits / Cash Available
             rms_data = self.smart_api.rmsLimit()
             available_cash = 0.0
             if rms_data and rms_data.get("status"):
                 available_cash = float(rms_data.get("data", {}).get("net", 0.0))
 
-            # Fetch Holdings
             holdings_data = self.smart_api.holding()
             holdings_list = []
             if holdings_data and holdings_data.get("status"):
