@@ -23,6 +23,7 @@ from tickers import get_dynamic_tickers
 from smartapi import AngelOneClient
 from telegram_bot import set_smart_client, send_investment_suggestion, process_telegram_commands, run_telegram_bot_loop, send_critical_failure_alert
 from mng_db import DatabaseManager
+from utils import send_critical_failure_alert
 
 
 # Terminal ANSI Color Codes

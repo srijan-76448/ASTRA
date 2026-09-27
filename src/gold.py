@@ -4,6 +4,8 @@ import json
 from typing import Dict, Any
 from telegram_bot import send_critical_failure_alert
 
+from utils import send_critical_failure_alert
+
 logger = logging.getLogger("ASTRA_GOLD")
 
 BASE_GOLD_24K = 72500.0

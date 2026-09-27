@@ -22,6 +22,7 @@ from telegram.ext import (
 # custom modules for ASTRA
 from gold import fetch_gold_data, format_gold_message
 from mng_db import DatabaseManager
+from utils import send_critical_failure_alert
 
 # Silence verbose HTTP requests
 logging.getLogger("httpx").setLevel(logging.WARNING)

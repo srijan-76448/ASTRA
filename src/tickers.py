@@ -83,8 +83,3 @@ def get_dynamic_tickers() -> list:
     except Exception as e:
         logger.error(f"Error filtering stock prices: {e}")
         return []
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    tickers = get_dynamic_tickers()
-    print("\nDynamically Swept Tickers:", tickers)
