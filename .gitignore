@@ -3,7 +3,6 @@ bin/
 lib/
 lib64
 include/
-logs/
 config/
 share/
 tests/
