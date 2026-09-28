@@ -18,3 +18,13 @@ __pycache__/
 # Logs
 logs/
 *.log
+
+# SQLite Database Files
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / Editor Files
+.DS_Store
+.vscode/
+.idea/
