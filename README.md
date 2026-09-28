@@ -139,13 +139,19 @@ MAILER_TIME=EOD   # Options: EOD, EOW, EOM
 # RISK MANAGEMENT & CAPITAL BOUNDS
 # ==========================================
 MIN_TRADE_ALLOCATION=100.0       # Lower price bound (INR)
-MAX_TRADE_ALLOCATION=2000.0      # Upper price bound (INR)
+MAX_TRADE_ALLOCATION=2000.0       # Upper price bound (INR)
 PORTFOLIO_ALLOCATION_PCT=0.10    # Allocate 10% of available cash per trade
 RSI_LOWER_THRESHOLD=35.0         # Oversold threshold
 RSI_UPPER_THRESHOLD=65.0         # Overbought threshold
 TICKERS_COUNT=50                 # Number of stocks to evaluate per cycle
 ASTRA_CYCLE_BUFFER=5             # Execution loop interval in minutes
 
+# ==========================================
+# TRAILING STOP LOSS (TSL) CONFIGURATION
+# ==========================================
+ENABLE_TRAILING_STOP=true
+STOP_LOSS_PCT=0.05
+TRAILING_STOP_PCT=0.04
 ```
 
 ---
