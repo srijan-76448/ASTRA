@@ -256,5 +256,3 @@ You can interact with ASTRA in real time directly from your Telegram chat:
 * **Cooldown Mechanism**: Prevents repeated alerts for the same stock within an 8-hour window.
 * **Non-Destructive Sheet Updates**: Preserves dashboard historical records when market scanning is paused or offline.
 * **Graceful Exit**: Handles `KeyboardInterrupt` (`Ctrl+C`) cleanly, ensuring logging streams, database handles, and API connections close gracefully.
-
-```
