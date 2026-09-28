@@ -195,7 +195,7 @@ To allow ASTRA to read/write performance dashboards without manual authorization
 
 ```bash
 # Clone this repository
-git clone [https://github.com/srijan-76448/ASTRA-V1](https://github.com/srijan-76448/ASTRA-V1)
+git clone https://github.com/srijan-76448/ASTRA-V1
 
 # Navigate to the repository
 cd ASTRA
