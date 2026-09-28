@@ -9,12 +9,10 @@ from pathlib import Path
 import yfinance as yf
 from dotenv import load_dotenv
 
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(BASE_DIR / "src"))
 
-
-from decision_engine import analyze_ticker_data
+from decision_engine import analyze_ticker_data, evaluate_exit_signal
 from portfolio_fetcher import sync_dashboard_data, get_cost_price_from_sheet
 from mailer import send_eod_email_report
 from tickers import get_dynamic_tickers
@@ -22,7 +20,6 @@ from smartapi import AngelOneClient
 from telegram_bot import set_smart_client, send_investment_suggestion, run_telegram_bot_loop
 from mng_db import DatabaseManager
 from utils import send_critical_failure_alert, clean_ticker_symbol
-
 
 CLR_RESET = "\033[0m"
 CLR_BOLD = "\033[1m"
@@ -81,11 +78,10 @@ def mark_eod_mail_sent():
 
 def should_trigger_mail(mailer_mode: str) -> bool:
     now = datetime.datetime.now()
-    
+
     if mailer_mode == "NOW":
         return True
 
-    # Suppress scheduled EOD mails on weekends (Saturday=5, Sunday=6)
     if now.weekday() >= 5:
         logger.info("Weekend detected. Suppressing scheduled EOD email report.")
         return False
@@ -157,13 +153,21 @@ def evaluate_buy_signal(metrics: dict, available_cash: float, min_alloc: float, 
     return None, 0.0, ""
 
 
-def evaluate_sell_signal(holding: dict, metrics: dict, rsi_upper: float, credentials_file: Path, spreadsheet_id: str):
+def evaluate_sell_signal(
+    holding: dict,
+    metrics: dict,
+    rsi_upper: float,
+    credentials_file: Path,
+    spreadsheet_id: str,
+    stop_loss_pct: float = 0.05,
+    trailing_stop_pct: float = 0.04,
+    enable_tsl: bool = True
+):
     ticker = holding.get("ticker", "")
     current_price = metrics.get("price", holding.get("current_price", 0.0))
     rsi = metrics.get("rsi", 50.0)
     signals = metrics.get("signals", [])
 
-    # Fetch cost price directly from Google Sheet
     cost_price = 0.0
     if credentials_file.exists() and spreadsheet_id:
         cost_price = get_cost_price_from_sheet(
@@ -173,22 +177,42 @@ def evaluate_sell_signal(holding: dict, metrics: dict, rsi_upper: float, credent
             tab_name="Wallet_and_Holdings"
         )
 
-    # Fallback to broker average price if not found in Google Sheet
     if cost_price == 0.0:
         cost_price = holding.get("avg_price", current_price)
 
-    pnl_pct = ((current_price - cost_price) / cost_price) * 100 if cost_price > 0 else 0.0
+    prev_peak = cost_price
+    if hasattr(db, "get_highest_price"):
+        try:
+            prev_peak = db.get_highest_price(ticker) or cost_price
+        except Exception as e:
+            logger.warning(f"Failed to load peak price for {ticker}: {e}")
 
-    if rsi >= rsi_upper or "MACD_BEARISH_CROSS" in signals or "RSI_OVERBOUGHT" in signals:
-        return (
-            "SELL (EXIT / TAKE PROFIT)",
-            f"RSI overbought ({rsi:.1f}) or bearish crossover. Cost Price: ₹{cost_price:.2f}, Current Price: ₹{current_price:.2f}, P&L: {pnl_pct:+.2f}%"
-        )
-    elif pnl_pct <= -5.0:
-        return (
-            "SELL (STOP LOSS)",
-            f"Position hit stop loss threshold of -5.0%. Cost Price: ₹{cost_price:.2f}, Current Price: ₹{current_price:.2f}, P&L: {pnl_pct:.2f}%"
-        )
+    current_peak = max(prev_peak, current_price, cost_price)
+
+    if current_peak > prev_peak and hasattr(db, "update_highest_price"):
+        try:
+            db.update_highest_price(ticker, current_peak)
+            logger.info(f"📈 Updated highest peak price for {ticker}: ₹{current_peak:.2f}")
+        except Exception as e:
+            logger.error(f"Failed to update peak price in DB for {ticker}: {e}")
+
+    macd_bearish = "MACD_BEARISH_CROSS" in signals or "RSI_OVERBOUGHT" in signals
+
+    should_sell, reason, stop_floor = evaluate_exit_signal(
+        current_price=current_price,
+        cost_price=cost_price,
+        highest_price=current_peak,
+        stop_loss_pct=stop_loss_pct,
+        trailing_stop_pct=trailing_stop_pct,
+        enable_tsl=enable_tsl,
+        rsi_val=rsi,
+        macd_bearish=macd_bearish
+    )
+
+    if should_sell:
+        pnl_pct = ((current_price - cost_price) / cost_price) * 100 if cost_price > 0 else 0.0
+        full_reasoning = f"{reason} | Cost: ₹{cost_price:.2f}, Price: ₹{current_price:.2f}, Peak: ₹{current_peak:.2f}, P&L: {pnl_pct:+.2f}%"
+        return "SELL (EXIT / TAKE PROFIT)", full_reasoning
 
     return None, ""
 
@@ -207,6 +231,7 @@ def extract_ticker_df(data, ticker: str, is_multi: bool):
     except Exception:
         return None
 
+
 def run_pipeline(force_email_now: bool = False) -> bool:
     load_dotenv(BASE_DIR / ".env", override=True)
 
@@ -215,15 +240,18 @@ def run_pipeline(force_email_now: bool = False) -> bool:
     alloc_pct = float(os.getenv("PORTFOLIO_ALLOCATION_PCT", 0.10))
     rsi_lower = float(os.getenv("RSI_LOWER_THRESHOLD", 35.0))
     rsi_upper = float(os.getenv("RSI_UPPER_THRESHOLD", 65.0))
+    stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", 0.05))
+    trailing_stop_pct = float(os.getenv("TRAILING_STOP_PCT", 0.04))
+    enable_tsl = os.getenv("ENABLE_TRAILING_STOP", "true").lower() == "true"
     tickers_count = int(os.getenv("TICKERS_COUNT", 50))
-    
+
     mailer_mode = "NOW" if force_email_now else os.getenv("MAILER_TIME", "EOD").upper()
-    
+
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
     credentials_file = BASE_DIR / os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service_account.json")
 
     logger.info(f"{CLR_BOLD}--- Cycle Configuration Loaded ---{CLR_RESET}")
-    logger.info(f"Price Window: ₹{min_alloc} - ₹{max_alloc} | Cap Alloc: {alloc_pct*100}% | Mailer Mode: {mailer_mode}")
+    logger.info(f"Price Window: ₹{min_alloc} - ₹{max_alloc} | Dynamic TSL: {enable_tsl} (Trail: {trailing_stop_pct*100}%) | Mailer Mode: {mailer_mode}")
 
     market_active = is_market_open()
 
@@ -240,7 +268,7 @@ def run_pipeline(force_email_now: bool = False) -> bool:
 
     available_cash = real_portfolio.get("available_cash", 0.0)
     holdings = real_portfolio.get("holdings", [])
-    
+
     total_invested = sum(h.get("invested_val", 0.0) for h in holdings)
     total_current = sum(h.get("current_val", 0.0) for h in holdings)
     total_pnl = sum(h.get("pnl", 0.0) for h in holdings)
@@ -263,9 +291,9 @@ def run_pipeline(force_email_now: bool = False) -> bool:
 
     if market_active:
         if holdings:
-            logger.info("Scanning active Angel One holdings for SELL triggers...")
+            logger.info("Scanning active Angel One holdings for dynamic TSL and SELL triggers...")
             holding_tickers = list(set([clean_ticker_symbol(h["ticker"]) for h in holdings if h.get("ticker")]))
-            
+
             if holding_tickers:
                 try:
                     h_data = yf.download(holding_tickers, period="6mo", group_by="ticker", progress=False)
@@ -279,7 +307,16 @@ def run_pipeline(force_email_now: bool = False) -> bool:
                         if df_h is not None and not df_h.empty:
                             h_metrics = analyze_ticker_data(df_h, ticker=t_raw)
                             if h_metrics:
-                                sell_action, sell_reasoning = evaluate_sell_signal(h, h_metrics, rsi_upper)
+                                sell_action, sell_reasoning = evaluate_sell_signal(
+                                    holding=h,
+                                    metrics=h_metrics,
+                                    rsi_upper=rsi_upper,
+                                    credentials_file=credentials_file,
+                                    spreadsheet_id=spreadsheet_id,
+                                    stop_loss_pct=stop_loss_pct,
+                                    trailing_stop_pct=trailing_stop_pct,
+                                    enable_tsl=enable_tsl
+                                )
                                 if sell_action:
                                     logger.info(f"{CLR_BOLD}{CLR_RED}🔻 SELL Signal [{t_raw}]:{CLR_RESET} {sell_action}")
                                     send_investment_suggestion(
@@ -298,7 +335,7 @@ def run_pipeline(force_email_now: bool = False) -> bool:
             tickers = get_dynamic_tickers()
 
         logger.info(f"{CLR_BOLD}{CLR_GREEN}Market is LIVE.{CLR_RESET} Sweeping {len(tickers)} market tickers...")
-        
+
         if tickers:
             try:
                 data = yf.download(tickers, period="6mo", group_by="ticker", progress=False)
@@ -309,11 +346,11 @@ def run_pipeline(force_email_now: bool = False) -> bool:
                         df = extract_ticker_df(data, ticker, is_multi_m)
                         if df is None or df.empty:
                             continue
-                        
+
                         metrics = analyze_ticker_data(df, ticker=ticker)
                         if not metrics:
                             continue
-                            
+
                         scan_results[ticker] = metrics
                         price = metrics["price"]
 
@@ -374,13 +411,14 @@ def run_pipeline(force_email_now: bool = False) -> bool:
 
     return market_active
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASTRA Algorithmic Trading Engine")
     parser.add_argument("--email-now", action="store_true", help="Force send an immediate debug email report")
     args = parser.parse_args()
 
     logger.info(f"{CLR_BOLD}{CLR_MAGENTA}=== Starting ASTRA Engine ==={CLR_RESET}")
-    
+
     bot_thread = threading.Thread(target=run_telegram_bot_loop, daemon=True)
     bot_thread.start()
     logger.info("Telegram Interactive Bot Listener initialized in background.")
@@ -394,18 +432,18 @@ if __name__ == "__main__":
 
             start_time = time.time()
             market_active = run_pipeline(force_email_now=args.email_now)
-            
+
             if args.email_now:
                 args.email_now = False
 
             elapsed = time.time() - start_time
             target_interval = live_loop_interval if market_active else closed_loop_interval
             sleep_duration = max(0, target_interval - elapsed)
-            
+
             sleep_mins = int(sleep_duration // 60)
             logger.info(f"{CLR_BLUE}Iteration complete. Sleeping for {sleep_mins} minutes...{CLR_RESET}\n")
             time.sleep(sleep_duration)
-            
+
     except KeyboardInterrupt:
         logger.info(f"\n{CLR_RED}{CLR_BOLD}[!] Gracefully shutting down ASTRA Engine. Goodbye!{CLR_RESET}")
         sys.exit(0)

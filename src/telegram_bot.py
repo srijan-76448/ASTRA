@@ -7,6 +7,7 @@ import requests
 import logging
 import asyncio
 import yfinance as yf
+import datetime
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from dotenv import set_key, load_dotenv
@@ -80,6 +81,15 @@ def init_env_backup():
 def get_env_val(key: str, default: str = "") -> str:
     load_dotenv(ENV_FILE, override=True)
     return os.getenv(key, default)
+
+def is_market_open() -> bool:
+    """Checks if current time falls within NSE trading hours (9:15 AM - 3:30 PM IST, Mon-Fri)."""
+    now = datetime.datetime.now()
+    if now.weekday() >= 5:
+        return False
+    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_start <= now <= market_end
 
 def load_alert_cache() -> dict:
     if CACHE_FILE.exists():
@@ -222,9 +232,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     min_p = get_env_val("MIN_TRADE_ALLOCATION", "100.0")
     max_p = get_env_val("MAX_TRADE_ALLOCATION", "500.0")
 
+    market_active = is_market_open()
+    market_status_str = "🟢 Live (OPEN)" if market_active else "🔴 Closed"
+
     msg = (
         "<b>🔄 ASTRA SYSTEM TELEMETRY</b>\n"
         "-------------------------------------\n"
+        f"• <b>Market Status:</b> {market_status_str}\n"
         f"• <b>Cycle Buffer:</b> {buf} minutes\n"
         f"• <b>Ticker Sweep Count:</b> {tickers}\n"
         f"• <b>Price Allocation Window:</b> ₹{min_p} - ₹{max_p}\n"

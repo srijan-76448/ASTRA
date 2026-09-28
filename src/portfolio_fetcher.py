@@ -83,7 +83,7 @@ def sync_dashboard_data(
             except gspread.exceptions.WorksheetNotFound:
                 wallet_ws = sheet.add_worksheet(title=wallet_tab_name, rows=100, cols=10)
 
-            # Preserve existing static entries (Buy Price, Quantity, Invested Amount)
+            # Preserve existing static entries (Buy Price and Quantity)
             existing_map = {}
             try:
                 all_vals = wallet_ws.get_all_values()
@@ -121,8 +121,7 @@ def sync_dashboard_data(
                     "TOTAL INVESTED (INR)",
                     "CURRENT VALUE (INR)",
                     "P&L AMOUNT (INR)",
-                    "P&L (%)",
-                    "STATUS"
+                    "P&L (%)"
                 ]
             ]
 
@@ -143,21 +142,12 @@ def sync_dashboard_data(
                             avg_price = float(str(prev.get("BUY PRICE (INR)", h.get("avg_price", curr_price))).replace("₹", "").replace(",", "").strip())
                         except ValueError:
                             avg_price = float(h.get("avg_price", curr_price))
-
-                        invested_val_str = str(prev.get("TOTAL INVESTED (INR)", "")).strip()
-                        if invested_val_str and not invested_val_str.startswith("="):
-                            try:
-                                total_invested_val = float(invested_val_str.replace("₹", "").replace(",", "").strip())
-                                invested_formula = total_invested_val
-                            except ValueError:
-                                invested_formula = f"=B{idx}*C{idx}"
-                        else:
-                            invested_formula = f"=B{idx}*C{idx}"
                     else:
                         qty = float(h.get("qty", 1))
                         avg_price = float(h.get("avg_price", curr_price))
-                        invested_formula = f"=B{idx}*C{idx}"
 
+                    # Automated Google Sheets formulas
+                    invested_formula = f"=B{idx}*C{idx}"
                     current_val_formula = f"=B{idx}*D{idx}"
                     pnl_amt_formula = f"=F{idx}-E{idx}"
                     pnl_pct_formula = f"=IF(E{idx}>0, ((F{idx}-E{idx})/E{idx}), 0)"
@@ -170,8 +160,7 @@ def sync_dashboard_data(
                         invested_formula,
                         current_val_formula,
                         pnl_amt_formula,
-                        pnl_pct_formula,
-                        "HOLDING"
+                        pnl_pct_formula
                     ])
             else:
                 wallet_rows.append(["No active holdings in Angel One account.", "", "", "", "", "", "", "", ""])
