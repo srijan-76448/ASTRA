@@ -160,9 +160,9 @@ ASTRA_CYCLE_BUFFER=5             # Execution loop interval in minutes
 # ==========================================
 # TRAILING STOP LOSS (TSL) CONFIGURATION
 # ==========================================
-ENABLE_TRAILING_STOP=true
-STOP_LOSS_PCT=0.05
-TRAILING_STOP_PCT=0.04
+ENABLE_TRAILING_STOP=true        # Enable / disable dynamic TSL engine
+STOP_LOSS_PCT=0.05               # Hard Stop Loss at -5%
+TRAILING_STOP_PCT=0.04           # Trailing Stop Loss at 4% drawdown from peak
 
 ```
 
@@ -207,7 +207,7 @@ Before executing the system, follow these steps to configure your third-party in
 
 ```bash
 # Clone this repository
-git clone [https://github.com/srijan-76448/ASTRA-V1](https://github.com/srijan-76448/ASTRA-V1)
+git clone https://github.com/srijan-76448/ASTRA-V1
 
 # Navigate to the repository
 cd ASTRA-V1
