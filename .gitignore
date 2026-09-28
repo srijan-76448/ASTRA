@@ -3,6 +3,10 @@ bin/
 lib/
 lib64
 include/
+logs/
+config/
+share/
+tests/
 pyvenv.cfg
 __pycache__/
 *.pyc
