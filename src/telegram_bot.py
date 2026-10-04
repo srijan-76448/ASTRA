@@ -1,633 +1,2269 @@
-import os
-import re
-import time
+"""
+ASTRA Telegram Runtime.
+
+Runtime responsibilities:
+- Telegram command/control plane.
+- Smart Intraday activation.
+- SIP activation and target management.
+- Global/module runtime control.
+- Runtime configuration through privileged /set.
+- Precious-metals telemetry through hidden /gold.
+- Status and wallet telemetry.
+
+Important:
+- Runtime commands do not modify .env.
+- /gold is intentionally hidden from /help.
+- /intraday_off has been removed.
+- /kill, /start, /set and /suspend are visible commands.
+- /set requires authentication for every invocation.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
 import json
-import shutil
-import requests
 import logging
-import asyncio
-import yfinance as yf
-import datetime
+import re
+from html import escape
 from pathlib import Path
-from logging.handlers import RotatingFileHandler
-from dotenv import set_key, load_dotenv
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+from typing import Any, Optional
+
+from dotenv import load_dotenv
+
+from mng_db import DatabaseManager
+from utils import (
+    SettingsError,
+    get_env as _utils_get_env,
+    get_setting,
+    get_settings,
+    save_settings,
+    update_setting,
 )
 
-from gold import fetch_gold_data, format_gold_message
-from mng_db import DatabaseManager
-from utils import send_critical_failure_alert, clean_ticker_symbol
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+BASE_DIR = (
+    Path(__file__)
+    .resolve()
+    .parent
+    .parent
+)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-ENV_FILE = BASE_DIR / ".env"
-ENV_BAK_FILE = BASE_DIR / ".env.bak"
-CACHE_FILE = BASE_DIR / "alert_cache.json"
-LOG_FILE = BASE_DIR / "astra_bot.log"
-ALERT_COOLDOWN_SECONDS = 6 * 3600
+load_dotenv(
+    BASE_DIR / ".env",
+    override=True,
+)
 
-logger = logging.getLogger("ASTRA_TELEGRAM")
-logger.setLevel(logging.INFO)
-file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
-formatter = logging.Formatter("%(asctime)s - [%(levelname)s] - %(message)s")
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
+logger = logging.getLogger(
+    "ASTRA_TELEGRAM"
+)
 
 db = DatabaseManager()
 
-IS_SUSPENDED = False
-ACTIVE_SMART_CLIENT = None
+SMART_CLIENT = None
+INTRADAY_ENGINE = None
+SIP_ENGINE = None
 
-def set_smart_client(client_instance):
-    global ACTIVE_SMART_CLIENT
-    ACTIVE_SMART_CLIENT = client_instance
-    logger.info("Successfully registered active SmartAPI client with Telegram module.")
+# ----------------------------------------------------------------------
+# Runtime control state
+# ----------------------------------------------------------------------
 
-def get_active_smart_client():
-    global ACTIVE_SMART_CLIENT
-    client = ACTIVE_SMART_CLIENT
+ASTRA_KILLED = False
 
-    if not client:
-        try:
-            from smartapi import AngelOneClient
-            client = AngelOneClient()
-            if hasattr(client, "authenticate") and callable(client.authenticate):
-                client.authenticate()
-            ACTIVE_SMART_CLIENT = client
-        except Exception as e:
-            logger.error(f"Auto-Reauthentication failed: {e}")
-            send_critical_failure_alert(f"SmartAPI Auto-Reauthentication Failure: {e}")
-            return None
+SUSPEND_UNTIL: Optional[dt.datetime] = None
 
-    return client
+MODULE_KILLS: set[str] = set()
 
-def init_env_backup():
-    if ENV_FILE.exists() and not ENV_BAK_FILE.exists():
-        try:
-            shutil.copyfile(ENV_FILE, ENV_BAK_FILE)
-            logger.info(f"Created initial environment backup at: {ENV_BAK_FILE}")
-        except Exception as e:
-            logger.error(f"Failed to create .env.bak: {e}")
+# Runtime settings are persisted in settings.json through utils.py.
+# Critical secrets remain in .env and are never exposed through /config or /set.
 
-def get_env_val(key: str, default: str = "") -> str:
-    load_dotenv(ENV_FILE, override=True)
-    return os.getenv(key, default)
+TELEGRAM_ACTIVE = False
 
-def is_market_open() -> bool:
-    """Checks if current time falls within NSE trading hours (9:15 AM - 3:30 PM IST, Mon-Fri)."""
-    now = datetime.datetime.now()
-    if now.weekday() >= 5:
-        return False
-    market_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return market_start <= now <= market_end
+CACHE_FILE = (
+    BASE_DIR
+    / "data"
+    / "telegram_cache.json"
+)
 
-def load_alert_cache() -> dict:
-    if CACHE_FILE.exists():
-        try:
-            with open(CACHE_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to read alert cache from disk: {e}")
-            return {}
-    return {}
 
-def save_alert_cache(cache: dict):
+# ======================================================================
+# Shared clients / providers
+# ======================================================================
+
+def set_smart_client(
+    client_instance,
+) -> None:
+    """Register the shared Angel One client."""
+
+    global SMART_CLIENT
+
+    SMART_CLIENT = client_instance
+
+
+def set_intraday_engine_provider(
+    client,
+    database=None,
+) -> None:
+    """Register the shared Smart Intraday engine."""
+
+    global INTRADAY_ENGINE
+
+    from intraday_trading import (
+        get_intraday_engine,
+    )
+
+    INTRADAY_ENGINE = get_intraday_engine(
+        client,
+        database or db,
+    )
+
+
+def set_sip_engine_provider(
+    engine,
+) -> None:
+    """
+    Register the shared SIP engine.
+
+    main.py owns the engine lifecycle; Telegram only controls it.
+    """
+
+    global SIP_ENGINE
+
+    SIP_ENGINE = engine
+
+
+# ======================================================================
+# Environment / runtime configuration
+# ======================================================================
+
+def get_env(
+    key: str,
+    default: str = "",
+) -> str:
+    """Return a critical environment value from .env/environment.
+
+    Runtime-configurable values belong to settings.json and must be accessed
+    through get_setting(). This helper intentionally does not provide a
+    settings.json fallback so secrets cannot accidentally migrate into the
+    runtime configuration layer.
+    """
+
+    value = _utils_get_env(key, default)
+    return value if value is not None else default
+
+
+def _get_setting_value(
+    path: str,
+    default: Any = None,
+) -> Any:
+    """Read a persistent runtime setting from settings.json."""
+
     try:
-        with open(CACHE_FILE, "w") as f:
-            json.dump(cache, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to write alert cache to disk: {e}")
+        return get_setting(path, default)
+    except SettingsError as exc:
+        logger.error("Unable to read runtime setting %s: %s", path, exc)
+        return default
 
-def parse_duration_to_seconds(duration_str: str) -> int | None:
-    match = re.match(r"^(\d+)([mh])$", duration_str.lower().strip())
+
+def _get_int(
+    path: str,
+    default: int,
+) -> int:
+    try:
+        return int(_get_setting_value(path, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_float(
+    path: str,
+    default: float,
+) -> float:
+    try:
+        return float(_get_setting_value(path, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_bool(
+    path: str,
+    default: bool = False,
+) -> bool:
+    value = _get_setting_value(path, default)
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+
+    return default
+
+
+def _get_setting_path(key: str) -> Optional[str]:
+    """Resolve a user-facing /set key to its settings.json path."""
+
+    normalized = key.strip().upper()
+    return _CONFIGURABLE_SETTINGS.get(normalized)
+
+
+# ======================================================================
+# Runtime state helpers
+# ======================================================================
+
+def _now_ist() -> dt.datetime:
+    """Return current IST time."""
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        return dt.datetime.now(
+            ZoneInfo("Asia/Kolkata")
+        )
+
+    except Exception:
+        return dt.datetime.now(
+            dt.timezone.utc
+        ).astimezone()
+
+
+def is_astra_killed() -> bool:
+    """Return the global ASTRA kill state."""
+
+    return ASTRA_KILLED
+
+
+def is_module_killed(
+    module: str,
+) -> bool:
+
+    return module.lower().strip() in MODULE_KILLS
+
+
+def is_suspended() -> bool:
+    """Return whether a temporary suspension is currently active."""
+
+    global SUSPEND_UNTIL
+
+    if SUSPEND_UNTIL is None:
+        return False
+
+    if _now_ist() >= SUSPEND_UNTIL:
+        SUSPEND_UNTIL = None
+        return False
+
+    return True
+
+
+def get_suspend_until() -> Optional[dt.datetime]:
+    """Return active suspension expiry, if any."""
+
+    if not is_suspended():
+        return None
+
+    return SUSPEND_UNTIL
+
+
+def _runtime_status_text() -> str:
+    """Return the current global runtime state."""
+
+    if ASTRA_KILLED:
+        return "🔴 KILLED"
+
+    if is_suspended():
+        return "🟡 SUSPENDED"
+
+    return "🟢 ACTIVE"
+
+
+def _operational_blocked(
+    module: Optional[str] = None,
+) -> bool:
+    """
+    Return whether operational activity should be blocked.
+
+    Telegram/status/telemetry commands deliberately do not use this helper.
+    """
+
+    if ASTRA_KILLED:
+        return True
+
+    if is_suspended():
+        return True
+
+    if module and is_module_killed(module):
+        return True
+
+    return False
+
+
+async def _reject_operational_command(
+    update,
+    module: Optional[str] = None,
+) -> bool:
+    """Reject commands that are blocked by runtime control."""
+
+    if not _operational_blocked(module):
+        return False
+
+    if ASTRA_KILLED:
+
+        await update.message.reply_text(
+            (
+                "🔴 <b>ASTRA is killed.</b>\n\n"
+                "Operational activity is currently disabled.\n"
+                "Use /start to resume ASTRA."
+            ),
+            parse_mode="HTML",
+        )
+
+        return True
+
+    if is_suspended():
+
+        until = get_suspend_until()
+
+        if until is not None:
+            expiry = until.strftime(
+                "%H:%M:%S IST"
+            )
+        else:
+            expiry = "automatically"
+
+        await update.message.reply_text(
+            (
+                "🟡 <b>ASTRA is temporarily suspended.</b>\n\n"
+                f"Resume: <b>{expiry}</b>"
+            ),
+            parse_mode="HTML",
+        )
+
+        return True
+
+    if module and is_module_killed(module):
+
+        await update.message.reply_text(
+            (
+                f"🔴 <b>{escape(module.title())} is killed.</b>\n\n"
+                "Use /start for global recovery or "
+                f"remove the module kill before activating {escape(module)}."
+            ),
+            parse_mode="HTML",
+        )
+
+        return True
+
+    return False
+
+
+# ======================================================================
+# Cache
+# ======================================================================
+
+def load_cache() -> dict:
+    try:
+
+        if not CACHE_FILE.exists():
+            return {}
+
+        return json.loads(
+            CACHE_FILE.read_text(
+                encoding="utf-8",
+            )
+        )
+
+    except Exception:
+        return {}
+
+
+def save_cache(
+    cache: dict,
+) -> None:
+
+    try:
+
+        CACHE_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        CACHE_FILE.write_text(
+            json.dumps(
+                cache,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Telegram cache save failed: %s",
+            exc,
+        )
+
+
+# ======================================================================
+# Telegram send helper
+# ======================================================================
+
+def send_telegram_message(
+    message_html: str,
+) -> None:
+
+    token = get_env(
+        "TELEGRAM_BOT_TOKEN"
+    )
+
+    chat_id = get_env(
+        "TELEGRAM_CHAT_ID"
+    )
+
+    if not token or not chat_id:
+
+        logger.warning(
+            "Telegram credentials unavailable."
+        )
+
+        return
+
+    try:
+
+        import requests
+
+        response = requests.post(
+            (
+                "https://api.telegram.org/"
+                f"bot{token}/sendMessage"
+            ),
+            json={
+                "chat_id": chat_id,
+                "text": message_html,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+
+        if not response.ok:
+
+            logger.warning(
+                "Telegram send failed: %s",
+                response.text,
+            )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Telegram send exception: %s",
+            exc,
+        )
+
+
+# ======================================================================
+# Investment suggestion
+# ======================================================================
+
+def send_investment_suggestion(
+    ticker: str,
+    strategy: str,
+    amount: float,
+    current_price: float,
+    reasoning: str,
+) -> None:
+
+    message = (
+        f"<b>ASTRA SIGNAL: {escape(ticker)}</b>\n\n"
+        f"• Strategy: {escape(strategy)}\n"
+        f"• Price: ₹{current_price:,.2f}\n"
+        f"• Allocation: ₹{amount:,.2f}\n"
+        f"• Reason: {escape(reasoning)}\n\n"
+        "<i>Advisory only — "
+        "no order was submitted.</i>"
+    )
+
+    send_telegram_message(
+        message
+    )
+
+
+# ======================================================================
+# /help
+# ======================================================================
+
+async def cmd_help(
+    update,
+    context,
+):
+
+    await update.message.reply_text(
+        (
+            "<b>ASTRA Commands</b>\n\n"
+
+            "<b>Core</b>\n"
+            "/status — show ASTRA status\n"
+            "/portfolio — show wallet\n"
+            "/analyze — use normal market analysis\n"
+            "/config — show configurable settings\n"
+            "/cfg — alias for /config\n"
+
+            "\n<b>Runtime Control</b>\n"
+            "/kill — stop ASTRA operations\n"
+            "/kill &lt;module&gt; — stop a specific module\n"
+            "/start — resume ASTRA\n"
+            "/suspend &lt;duration&gt; — temporarily suspend operations\n"
+            "/set — privileged runtime configuration\n"
+
+            "\n<b>Smart Intraday</b>\n"
+            "/intraday — activate intraday for today\n"
+
+            "\n<b>SIP</b>\n"
+            "/SIP — activate SIP runtime\n"
+            "/SIP --HELP — show SIP commands\n"
+
+            "\n/help — show commands"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ======================================================================
+# /intraday
+# ======================================================================
+
+async def cmd_intraday(
+    update,
+    context,
+):
+
+    if await _reject_operational_command(
+        update,
+        "intraday",
+    ):
+        return
+
+    global INTRADAY_ENGINE
+
+    if SMART_CLIENT is None:
+
+        await update.message.reply_text(
+            "❌ Shared Angel One client is unavailable."
+        )
+
+        return
+
+    if not getattr(
+        SMART_CLIENT,
+        "is_authenticated",
+        False,
+    ):
+
+        await update.message.reply_text(
+            (
+                "❌ Shared Angel One session "
+                "is not authenticated.\n\n"
+                "/intraday was not activated."
+            )
+        )
+
+        return
+
+    if INTRADAY_ENGINE is None:
+
+        try:
+
+            set_intraday_engine_provider(
+                SMART_CLIENT,
+                db,
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Unable to initialize Smart Intraday engine."
+            )
+
+            await update.message.reply_text(
+                (
+                    "❌ Failed to initialize "
+                    f"Smart Intraday: {escape(str(exc))}"
+                )
+            )
+
+            return
+
+    try:
+
+        activated = INTRADAY_ENGINE.activate_daily()
+
+        if activated:
+
+            await update.message.reply_text(
+                (
+                    "🟢 <b>Smart Intraday activated.</b>\n\n"
+                    "Mode: DAILY\n"
+                    "Expiry: 15:30 IST\n"
+                    "Runtime .env: unchanged\n\n"
+                    "A first scan has been triggered."
+                ),
+                parse_mode="HTML",
+            )
+
+        else:
+
+            await update.message.reply_text(
+                (
+                    "❌ Smart Intraday activation failed.\n"
+                    "Check the ASTRA logs."
+                )
+            )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram /intraday failed."
+        )
+
+        await update.message.reply_text(
+            (
+                "❌ Intraday activation error: "
+                f"{escape(str(exc))}"
+            )
+        )
+
+
+# ======================================================================
+# /kill
+# ======================================================================
+
+async def cmd_kill(
+    update,
+    context,
+):
+
+    global ASTRA_KILLED
+
+    args = list(
+        getattr(
+            context,
+            "args",
+            [],
+        )
+        or []
+    )
+
+    if len(args) > 1:
+
+        await update.message.reply_text(
+            (
+                "❌ Invalid syntax.\n\n"
+                "/kill\n"
+                "/kill &lt;module&gt;"
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    if not args:
+
+        if ASTRA_KILLED:
+
+            await update.message.reply_text(
+                "🔴 ASTRA is already killed."
+            )
+
+            return
+
+        ASTRA_KILLED = True
+
+        try:
+
+            if INTRADAY_ENGINE is not None:
+
+                stop_method = getattr(
+                    INTRADAY_ENGINE,
+                    "stop",
+                    None,
+                )
+
+                if callable(stop_method):
+                    stop_method(
+                        reason="GLOBAL_KILL"
+                    )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to stop Smart Intraday during global kill."
+            )
+
+        await update.message.reply_text(
+            (
+                "🛑 <b>ASTRA KILLED</b>\n\n"
+                "Operational activity: <b>OFF</b>\n"
+                "Telegram: <b>ACTIVE</b>\n"
+                "Telemetry: <b>ACTIVE</b>\n"
+                "Mailing: <b>ACTIVE</b>\n\n"
+                "Use /start to resume ASTRA."
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    module = args[0].strip().lower()
+
+    allowed_modules = {
+        "intraday",
+        "sip",
+    }
+
+    if module not in allowed_modules:
+
+        await update.message.reply_text(
+            (
+                "❌ Unknown module.\n\n"
+                "Available modules:\n"
+                "• intraday\n"
+                "• sip"
+            )
+        )
+
+        return
+
+    MODULE_KILLS.add(
+        module
+    )
+
+    if module == "intraday":
+
+        try:
+
+            if INTRADAY_ENGINE is not None:
+
+                stop_method = getattr(
+                    INTRADAY_ENGINE,
+                    "stop",
+                    None,
+                )
+
+                if callable(stop_method):
+                    stop_method(
+                        reason="MODULE_KILL"
+                    )
+
+                else:
+
+                    stop_method = getattr(
+                        INTRADAY_ENGINE,
+                        "kill",
+                        None,
+                    )
+
+                    if callable(stop_method):
+                        stop_method()
+
+        except Exception:
+
+            logger.exception(
+                "Failed to stop Smart Intraday."
+            )
+
+    elif module == "sip":
+
+        try:
+
+            if SIP_ENGINE is not None:
+
+                deactivate = getattr(
+                    SIP_ENGINE,
+                    "deactivate",
+                    None,
+                )
+
+                if callable(deactivate):
+                    deactivate()
+
+        except Exception:
+
+            logger.exception(
+                "Failed to deactivate SIP runtime."
+            )
+
+    await update.message.reply_text(
+        (
+            f"🔴 <b>{escape(module.title())} killed.</b>\n\n"
+            "Other ASTRA services remain operational."
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ======================================================================
+# /start
+# ======================================================================
+
+async def cmd_start(
+    update,
+    context,
+):
+
+    global ASTRA_KILLED
+
+    ASTRA_KILLED = False
+
+    # /start is the global recovery command.
+    MODULE_KILLS.clear()
+
+    await update.message.reply_text(
+        (
+            "🟢 <b>ASTRA resumed.</b>\n\n"
+            "Global kill state: <b>CLEARED</b>\n"
+            "Module kills: <b>CLEARED</b>\n"
+            "Telegram: <b>ACTIVE</b>"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ======================================================================
+# /suspend
+# ======================================================================
+
+_DURATION_PATTERN = re.compile(
+    r"^(?P<value>[1-9]\d*)(?P<unit>[mMhH])$"
+)
+
+
+def _parse_suspend_duration(
+    value: str,
+) -> Optional[dt.timedelta]:
+
+    match = _DURATION_PATTERN.fullmatch(
+        value.strip()
+    )
+
     if not match:
         return None
 
-    val, unit = match.groups()
-    val = int(val)
-    return val * 60 if unit == "m" else val * 3600
-
-def send_telegram_message(message_html: str):
-    if IS_SUSPENDED:
-        logger.info("⏸️ Telegram bot is currently suspended. Suppressing outgoing telemetry message.")
-        return
-
-    token = get_env_val("TELEGRAM_BOT_TOKEN")
-    chat_id = get_env_val("TELEGRAM_CHAT_ID")
-
-    if not token or not chat_id:
-        logger.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing in .env")
-        return
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message_html,
-        "parse_mode": "HTML"
-    }
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        logger.error(f"Failed to dispatch Telegram message: {e}")
-
-def send_investment_suggestion(ticker: str, strategy: str, amount: float, current_price: float, reasoning: str):
-    if IS_SUSPENDED:
-        return
-
-    current_time = time.time()
-    cache_key = f"{ticker}_{strategy}".upper().strip()
-
-    cache = load_alert_cache()
-
-    expired_keys = [k for k, ts in cache.items() if current_time - ts > ALERT_COOLDOWN_SECONDS]
-    for k in expired_keys:
-        del cache[k]
-
-    if cache_key in cache:
-        last_sent_time = cache[cache_key]
-        elapsed_hours = (current_time - last_sent_time) / 3600.0
-        logger.info(
-            f"🚫 [DEDUPLICATED] Alert for {ticker} ({strategy}) was sent {elapsed_hours:.2f} hrs ago. "
-            f"Suppressing duplicate signal."
-        )
-        save_alert_cache(cache)
-        return
-
-    action_clean = "SELL" if "SELL" in strategy.upper() else "BUY"
-    emoji = "🔴" if action_clean == "SELL" else "🟢"
-
-    tsl = current_price * 0.98 if action_clean == "BUY" else current_price * 1.02
-    tp = current_price * 1.05 if action_clean == "BUY" else current_price * 0.95
-
-    msg = (
-        f"<b>{emoji} ASTRA TELEMETRY ALERT: {ticker}</b>\n\n"
-        f"• <b>Action:</b> <code>{action_clean}</code>\n"
-        f"• <b>Live Price:</b> ₹{current_price:,.2f}\n"
-        f"• <b>Stop Loss (TSL -2%):</b> ₹{tsl:,.2f}\n"
-        f"• <b>Target Price (TP +5%):</b> ₹{tp:,.2f}\n"
-        f"• <b>Allocated Amount:</b> ₹{amount:,.2f}\n"
-        f"• <b>Technical Reasoning:</b> {reasoning}\n"
+    amount = int(
+        match.group("value")
     )
 
-    send_telegram_message(msg)
+    unit = match.group("unit").lower()
 
-    cache[cache_key] = current_time
-    save_alert_cache(cache)
-    db.log_signal(ticker, strategy, current_price, 0.0, 0.0, action_clean)
+    if unit == "m":
+        return dt.timedelta(
+            minutes=amount
+        )
+
+    if unit == "h":
+        return dt.timedelta(
+            hours=amount
+        )
+
+    return None
 
 
-# ==========================================================
-# CLI-STYLE TEXT COMMAND INTERFACE
-# ==========================================================
+async def cmd_suspend(
+    update,
+    context,
+):
 
-async def cmd_resume_callback(context: ContextTypes.DEFAULT_TYPE):
-    global IS_SUSPENDED
-    IS_SUSPENDED = False
-    chat_id = context.job.chat_id
-    logger.info("🟢 [SUSPEND ENDED] Telegram bot timer elapsed. Back online...")
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="<b>🟢 Back online...</b>",
-        parse_mode="HTML"
+    global SUSPEND_UNTIL
+
+    args = list(
+        getattr(
+            context,
+            "args",
+            [],
+        )
+        or []
     )
 
+    if len(args) != 1:
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
-
-    help_text = (
-        "<b>💻 ASTRA CLI Terminal Commands</b>\n\n"
-        "<code>/status</code> - Output system status and cycle info\n"
-        "<code>/sheet</code> or <code>/spreadsheet</code> - Get live Google Sheets telemetry URL\n"
-        "<code>/config</code> or <code>/cfg</code> - Read raw .env configuration\n"
-        "<code>/set KEY VALUE</code> - Set or overwrite any .env variable\n"
-        "<code>/restore_default</code> or <code>/restore</code> - Restore .env from .env.bak\n"
-        "<code>/suspend DURATION</code> - Pause system (e.g., <code>/suspend 5m</code> or <code>/suspend 2h</code>)\n"
-        "<code>/portfolio</code> - Output portfolio state\n"
-        "<code>/analyze SYMBOL</code> - Instant stock technical analysis\n\n"
-        "<i>Examples:</i>\n"
-        "• <code>/analyze TATAMOTORS</code>\n"
-        "• <code>/suspend 30m</code>"
-    )
-    await update.message.reply_text(help_text, parse_mode="HTML")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
-
-    buf = get_env_val("ASTRA_CYCLE_BUFFER", "5")
-    tickers = get_env_val("TICKERS_COUNT", "50")
-    min_p = get_env_val("MIN_TRADE_ALLOCATION", "100.0")
-    max_p = get_env_val("MAX_TRADE_ALLOCATION", "500.0")
-
-    market_active = is_market_open()
-    market_status_str = "🟢 Live (OPEN)" if market_active else "🔴 Closed"
-
-    msg = (
-        "<b>🔄 ASTRA SYSTEM TELEMETRY</b>\n"
-        "-------------------------------------\n"
-        f"• <b>Market Status:</b> {market_status_str}\n"
-        f"• <b>Cycle Buffer:</b> {buf} minutes\n"
-        f"• <b>Ticker Sweep Count:</b> {tickers}\n"
-        f"• <b>Price Allocation Window:</b> ₹{min_p} - ₹{max_p}\n"
-        f"• <b>Backup State:</b> {'Found (.env.bak)' if ENV_BAK_FILE.exists() else 'Missing'}\n"
-        f"• <b>Status:</b> Active & Listening"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-async def cmd_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
-
-    sheet_id = get_env_val("GOOGLE_SHEETS_SPREADSHEET_ID")
-    if not sheet_id:
         await update.message.reply_text(
-            "❌ <code>GOOGLE_SHEETS_SPREADSHEET_ID</code> is missing in <code>.env</code>.",
-            parse_mode="HTML"
+            (
+                "❌ A suspension duration is required.\n\n"
+                "Examples:\n"
+                "/suspend 10m\n"
+                "/suspend 30m\n"
+                "/suspend 1h"
+            )
         )
+
         return
 
-    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-    msg = (
-        "<b>📊 ASTRA LIVE TELEMETRY SPREADSHEET</b>\n\n"
-        f"🔗 <a href=\"{sheet_url}\">Click here to open Google Sheet</a>\n\n"
-        f"<code>{sheet_url}</code>"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=False)
-
-
-async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
-
-    if not ENV_FILE.exists():
-        await update.message.reply_text("❌ <code>.env</code> file not found on disk.", parse_mode="HTML")
-        return
-
-    try:
-        with open(ENV_FILE, "r") as f:
-            lines = f.readlines()
-
-        masked_lines = []
-        for line in lines:
-            line_str = line.strip()
-            if not line_str or line_str.startswith("#"):
-                masked_lines.append(line_str)
-                continue
-
-            if "=" in line_str:
-                k, v = line_str.split("=", 1)
-                k_upper = k.strip().upper()
-                if "TOKEN" in k_upper or "SECRET" in k_upper or "PASSWORD" in k_upper:
-                    masked_v = v[:4] + "..." + v[-4:] if len(v) > 8 else "********"
-                    masked_lines.append(f"{k.strip()}={masked_v}")
-                else:
-                    masked_lines.append(line_str)
-            else:
-                masked_lines.append(line_str)
-
-        env_content = "\n".join(masked_lines)
-        msg = (
-            "<b>📄 CURRENT .env CONFIGURATION</b>\n"
-            f"<pre>{env_content}</pre>\n"
-            "Use <code>/set KEY VALUE</code> to update or add any setting."
-        )
-        await update.message.reply_text(msg, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to read <code>.env</code>: {str(e)}", parse_mode="HTML")
-
-async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "<b>Usage:</b> <code>/set KEY VALUE</code>\n"
-            "<i>Example:</i> <code>/set TICKERS_COUNT 60</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    key = args[0].strip()
-    val = " ".join(args[1:]).strip()
-
-    if (val.startswith("'") and val.endswith("'")) or (val.startswith('"') and val.endswith('"')):
-        val = val[1:-1]
-
-    try:
-        set_key(ENV_FILE, key, val, quote_mode="never")
-        await update.message.reply_text(
-            f"✅ <b>Updated .env variable:</b>\n"
-            f"<code>{key}</code> = <code>{val}</code>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ <b>Error modifying .env:</b> {str(e)}",
-            parse_mode="HTML"
-        )
-
-async def cmd_restore_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
-
-    if not ENV_BAK_FILE.exists():
-        await update.message.reply_text(
-            "❌ <b>Backup missing:</b> No <code>.env.bak</code> file found to restore from.",
-            parse_mode="HTML"
-        )
-        return
-
-    try:
-        shutil.copyfile(ENV_BAK_FILE, ENV_FILE)
-        await update.message.reply_text(
-            "🔄 <b>Configuration Restored:</b> <code>.env</code> has been successfully restored from <code>.env.bak</code>.",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ <b>Restore failed:</b> {str(e)}",
-            parse_mode="HTML"
-        )
-
-async def cmd_suspend(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global IS_SUSPENDED
-
-    if not context.args:
-        await update.message.reply_text(
-            "<b>Usage:</b> <code>/suspend DURATION</code>\n"
-            "<i>Examples:</i> <code>/suspend 5m</code> or <code>/suspend 2h</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    time_param = context.args[0]
-    seconds = parse_duration_to_seconds(time_param)
-
-    if seconds is None:
-        await update.message.reply_text(
-            "❌ <b>Invalid time format.</b> Use <code>m</code> for minutes or <code>h</code> for hours.",
-            parse_mode="HTML"
-        )
-        return
-
-    if context.job_queue is None:
-        await update.message.reply_text(
-            "❌ <b>JobQueue extension not installed.</b> Run: <code>pip install \"python-telegram-bot[job-queue]\"</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    IS_SUSPENDED = True
-    chat_id = update.effective_chat.id
-
-    context.job_queue.run_once(
-        cmd_resume_callback,
-        when=seconds,
-        chat_id=chat_id,
-        name=f"resume_{chat_id}"
+    duration = _parse_suspend_duration(
+        args[0]
     )
 
-    logger.info(f"⏸️ [SUSPENDED] Telegram bot suspended for {time_param} ({seconds}s).")
+    if duration is None:
+
+        await update.message.reply_text(
+            (
+                "❌ Invalid duration.\n\n"
+                "Use a positive duration such as "
+                "<code>10m</code>, "
+                "<code>30m</code> or "
+                "<code>1h</code>."
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    SUSPEND_UNTIL = (
+        _now_ist()
+        + duration
+    )
+
     await update.message.reply_text(
-        f"⏸️ <b>ASTRA engine suspended for {time_param}.</b>\n"
-        f"I will send <i>'Back online...'</i> when the duration completes.",
-        parse_mode="HTML"
+        (
+            "🟡 <b>ASTRA suspended.</b>\n\n"
+            f"Duration: <b>{escape(args[0])}</b>\n"
+            f"Resume: <b>"
+            f"{SUSPEND_UNTIL.strftime('%H:%M:%S IST')}"
+            f"</b>\n\n"
+            "Telegram, telemetry and critical alerts remain available."
+        ),
+        parse_mode="HTML",
     )
 
-async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
+
+# ======================================================================
+# /set
+# ======================================================================
+
+def _get_admin_password() -> str:
+    """Read the privileged /set password from TELEGRAM_PASSWORD in .env."""
+
+    return get_env("TELEGRAM_PASSWORD", "")
+
+
+# Public aliases are intentionally stable for Telegram users, while the
+# underlying storage uses the exact nested structure of settings.json.
+_CONFIGURABLE_SETTINGS: dict[str, str] = {
+    "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER": "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER",
+    "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER": "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER",
+    "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER": "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER",
+    "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER": "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER",
+    "ASTRA_FUNCTIONS.KILL": "ASTRA_FUNCTIONS.KILL",
+    "NORMAL_TRADING.TICKERS_COUNT": "NORMAL_TRADING.TICKERS_COUNT",
+    "NORMAL_TRADING.MIN_TRADE_ALLOCATION": "NORMAL_TRADING.MIN_TRADE_ALLOCATION",
+    "NORMAL_TRADING.MAX_TRADE_ALLOCATION": "NORMAL_TRADING.MAX_TRADE_ALLOCATION",
+    "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT": "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT",
+    "NORMAL_TRADING.RSI_LOWER_THRESHOLD": "NORMAL_TRADING.RSI_LOWER_THRESHOLD",
+    "NORMAL_TRADING.RSI_UPPER_THRESHOLD": "NORMAL_TRADING.RSI_UPPER_THRESHOLD",
+    "NORMAL_TRADING.ENABLE_TRAILING_STOP": "NORMAL_TRADING.ENABLE_TRAILING_STOP",
+    "NORMAL_TRADING.STOP_LOSS_PCT": "NORMAL_TRADING.STOP_LOSS_PCT",
+    "NORMAL_TRADING.TRAILING_STOP_PCT": "NORMAL_TRADING.TRAILING_STOP_PCT",
+    "INTRADAY.TRADING_ENGINE": "INTRADAY.TRADING_ENGINE",
+    "INTRADAY.LIVE_TRADING": "INTRADAY.LIVE_TRADING",
+    "INTRADAY.TICKERS_COUNT": "INTRADAY.TICKERS_COUNT",
+    "INTRADAY.SCAN_INTERVAL_SECONDS": "INTRADAY.SCAN_INTERVAL_SECONDS",
+    "INTRADAY.RSI_LOWER_THRESHOLD": "INTRADAY.RSI_LOWER_THRESHOLD",
+    "INTRADAY.RSI_UPPER_THRESHOLD": "INTRADAY.RSI_UPPER_THRESHOLD",
+    "INTRADAY.MIN_ALLOCATION": "INTRADAY.MIN_ALLOCATION",
+    "INTRADAY.MAX_ALLOCATION": "INTRADAY.MAX_ALLOCATION",
+    "INTRADAY.MAX_POSITIONS": "INTRADAY.MAX_POSITIONS",
+    "INTRADAY.MAX_DAILY_LOSS": "INTRADAY.MAX_DAILY_LOSS",
+    "INTRADAY.STOP_LOSS_PCT": "INTRADAY.STOP_LOSS_PCT",
+    "INTRADAY.TRAILING_STOP_PCT": "INTRADAY.TRAILING_STOP_PCT",
+    "INTRADAY.FORCE_EXIT_TIME": "INTRADAY.FORCE_EXIT_TIME",
+    "MAILER.TIME": "mailer.TIME",
+}
+
+# Backward-compatible short aliases for the old /set interface.
+_CONFIGURABLE_ALIASES: dict[str, str] = {
+    "ASTRA_CYCLE_BUFFER": "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER",
+    "NOTIFICATION_REPEAT_BUFFER": "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER",
+    "TICKERS_COUNT": "NORMAL_TRADING.TICKERS_COUNT",
+    "MIN_TRADE_ALLOCATION": "NORMAL_TRADING.MIN_TRADE_ALLOCATION",
+    "MAX_TRADE_ALLOCATION": "NORMAL_TRADING.MAX_TRADE_ALLOCATION",
+    "PORTFOLIO_ALLOCATION_PCT": "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT",
+    "RSI_LOWER_THRESHOLD": "NORMAL_TRADING.RSI_LOWER_THRESHOLD",
+    "RSI_UPPER_THRESHOLD": "NORMAL_TRADING.RSI_UPPER_THRESHOLD",
+    "ENABLE_TRAILING_STOP": "NORMAL_TRADING.ENABLE_TRAILING_STOP",
+    "STOP_LOSS_PCT": "NORMAL_TRADING.STOP_LOSS_PCT",
+    "TRAILING_STOP_PCT": "NORMAL_TRADING.TRAILING_STOP_PCT",
+    "INTRADAY_TRADING_ENGINE": "INTRADAY.TRADING_ENGINE",
+    "ASTRA_INTRADAY_LIVE_TRADING": "INTRADAY.LIVE_TRADING",
+    "INTRADAY_TICKERS_COUNT": "INTRADAY.TICKERS_COUNT",
+    "INTRADAY_SCAN_INTERVAL_SECONDS": "INTRADAY.SCAN_INTERVAL_SECONDS",
+    "INTRADAY_RSI_LOWER_THRESHOLD": "INTRADAY.RSI_LOWER_THRESHOLD",
+    "INTRADAY_RSI_UPPER_THRESHOLD": "INTRADAY.RSI_UPPER_THRESHOLD",
+    "INTRADAY_MIN_ALLOCATION": "INTRADAY.MIN_ALLOCATION",
+    "INTRADAY_MAX_ALLOCATION": "INTRADAY.MAX_ALLOCATION",
+    "INTRADAY_MAX_POSITIONS": "INTRADAY.MAX_POSITIONS",
+    "INTRADAY_MAX_DAILY_LOSS": "INTRADAY.MAX_DAILY_LOSS",
+    "INTRADAY_STOP_LOSS_PCT": "INTRADAY.STOP_LOSS_PCT",
+    "INTRADAY_TRAILING_STOP_PCT": "INTRADAY.TRAILING_STOP_PCT",
+    "INTRADAY_FORCE_EXIT_TIME": "INTRADAY.FORCE_EXIT_TIME",
+}
+
+_CONFIG_TYPES: dict[str, type] = {
+    "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER": int,
+    "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER": int,
+    "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER": int,
+    "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER": int,
+    "ASTRA_FUNCTIONS.KILL": bool,
+    "NORMAL_TRADING.TICKERS_COUNT": int,
+    "NORMAL_TRADING.MIN_TRADE_ALLOCATION": int,
+    "NORMAL_TRADING.MAX_TRADE_ALLOCATION": int,
+    "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT": float,
+    "NORMAL_TRADING.RSI_LOWER_THRESHOLD": int,
+    "NORMAL_TRADING.RSI_UPPER_THRESHOLD": int,
+    "NORMAL_TRADING.ENABLE_TRAILING_STOP": bool,
+    "NORMAL_TRADING.STOP_LOSS_PCT": float,
+    "NORMAL_TRADING.TRAILING_STOP_PCT": float,
+    "INTRADAY.TRADING_ENGINE": bool,
+    "INTRADAY.LIVE_TRADING": bool,
+    "INTRADAY.TICKERS_COUNT": int,
+    "INTRADAY.SCAN_INTERVAL_SECONDS": int,
+    "INTRADAY.RSI_LOWER_THRESHOLD": int,
+    "INTRADAY.RSI_UPPER_THRESHOLD": int,
+    "INTRADAY.MIN_ALLOCATION": int,
+    "INTRADAY.MAX_ALLOCATION": int,
+    "INTRADAY.MAX_POSITIONS": int,
+    "INTRADAY.MAX_DAILY_LOSS": float,
+    "INTRADAY.STOP_LOSS_PCT": float,
+    "INTRADAY.TRAILING_STOP_PCT": float,
+    "INTRADAY.FORCE_EXIT_TIME": str,
+    "mailer.TIME": str,
+}
+
+
+def _resolve_config_key(key: str) -> Optional[str]:
+    normalized = key.strip().upper()
+    if normalized in _CONFIGURABLE_SETTINGS:
+        return _CONFIGURABLE_SETTINGS[normalized]
+    return _CONFIGURABLE_ALIASES.get(normalized)
+
+
+def _parse_config_value(
+    path: str,
+    raw_value: str,
+) -> Any:
+    """Convert /set text into the type expected by settings.json."""
+
+    expected_type = _CONFIG_TYPES.get(path)
+    raw = raw_value.strip()
+
+    if not raw:
+        raise ValueError("Value cannot be empty.")
+
+    if expected_type is bool:
+        normalized = raw.lower()
+        if normalized in {"true", "1", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"false", "0", "no", "off", "disabled"}:
+            return False
+        raise ValueError("Expected a boolean value (true/false).")
+
+    if expected_type is int:
+        return int(raw)
+
+    if expected_type is float:
+        return float(raw)
+
+    if expected_type is str:
+        return raw
+
+    # Defensive fallback for future settings.
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+
+
+def _set_value_is_valid(
+    key: str,
+    value: str,
+) -> bool:
+    """Return whether a setting is permitted and has a non-empty value."""
+
+    return _resolve_config_key(key) is not None and bool(value.strip())
+
+
+def _format_config_value(value: Any) -> str:
+    """Format a setting value safely for Telegram HTML output."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    return str(value)
+
+
+async def cmd_set(
+    update,
+    context,
+):
+
+    args = list(
+        getattr(
+            context,
+            "args",
+            [],
+        )
+        or []
+    )
+
+    if len(args) < 3:
+        await update.message.reply_text(
+            (
+                "❌ Invalid syntax.\n\n"
+                "/set &lt;password&gt; &lt;SETTING&gt; &lt;VALUE&gt;"
+            ),
+            parse_mode="HTML",
+        )
         return
 
-    await update.message.reply_text("🔄 <i>Fetching live portfolio telemetry...</i>", parse_mode="HTML")
+    password = args[0]
+    key = args[1].strip()
+    value = " ".join(args[2:]).strip()
+
+    configured_password = _get_admin_password()
+
+    if (
+        not configured_password
+        or not password
+        or not __import__("secrets").compare_digest(
+            password,
+            configured_password,
+        )
+    ):
+        logger.warning("Rejected unauthenticated /set request.")
+        await update.message.reply_text("❌ Authentication failed.")
+        return
+
+    path = _resolve_config_key(key)
+
+    if path is None or not _set_value_is_valid(key, value):
+        await update.message.reply_text(
+            (
+                "❌ Unsupported runtime setting.\n\n"
+                "Use /config to see the settings exposed through /set."
+            )
+        )
+        return
 
     try:
-        client = get_active_smart_client()
-        if not client:
-            await update.message.reply_text("❌ Failed to authenticate with Angel One API.", parse_mode="HTML")
-            return
+        parsed_value = _parse_config_value(path, value)
+        update_setting(path, parsed_value, persist=True)
+    except (ValueError, TypeError, SettingsError) as exc:
+        logger.warning("Rejected /set for %s: %s", path, exc)
+        await update.message.reply_text(
+            f"❌ Invalid value for <code>{escape(path)}</code>: "
+            f"{escape(str(exc))}",
+            parse_mode="HTML",
+        )
+        return
 
-        smart_api_handle = getattr(client, "smart_api", client)
-        holdings_res = smart_api_handle.holding()
-        rms_res = smart_api_handle.rmsLimit()
+    logger.info("Runtime configuration updated: %s", path)
 
-        total_invested = 0.0
-        total_current = 0.0
-        holding_details = []
+    await update.message.reply_text(
+        (
+            "🟢 <b>Runtime configuration updated.</b>\n\n"
+            f"Setting: <code>{escape(path)}</code>\n"
+            f"Value: <code>{escape(_format_config_value(parsed_value))}</code>\n\n"
+            "Saved to <code>settings.json</code>.\n"
+            "The <code>.env</code> file was not modified."
+        ),
+        parse_mode="HTML",
+    )
 
-        if holdings_res and holdings_res.get("status") and holdings_res.get("data"):
-            holdings = holdings_res["data"]
-            for item in holdings:
-                qty = int(item.get("quantity", 0))
-                avg_price = float(item.get("averageprice", 0.0))
-                ltp = float(item.get("ltp", 0.0))
-                symbol = item.get("tradingsymbol", "N/A")
 
-                inv_val = qty * avg_price
-                curr_val = qty * ltp
-                total_invested += inv_val
-                total_current += curr_val
+# ======================================================================
+# /status
+# ======================================================================
 
-                pnl = curr_val - inv_val
-                pnl_pct = (pnl / inv_val * 100) if inv_val > 0 else 0.0
-                pnl_icon = "🟢" if pnl >= 0 else "🔴"
+def _market_is_open() -> bool:
 
-                holding_details.append(
-                    f"• <b>{symbol}</b> ({qty} Qty)\n"
-                    f"  Avg: ₹{avg_price:,.2f} | LTP: ₹{ltp:,.2f}\n"
-                    f"  P&amp;L: {pnl_icon} ₹{pnl:,.2f} ({pnl_pct:+.2f}%)"
+    now = _now_ist()
+
+    if now.weekday() >= 5:
+        return False
+
+    market_open = dt.time(
+        9,
+        15,
+    )
+
+    market_close = dt.time(
+        15,
+        30,
+    )
+
+    return (
+        market_open
+        <= now.time()
+        < market_close
+    )
+
+
+def _get_intraday_status() -> tuple[str, str]:
+
+    if is_module_killed("intraday"):
+        return (
+            "🔴 KILLED",
+            "Module killed.",
+        )
+
+    active_session = None
+
+    try:
+        active_session = (
+            db.get_active_intraday_session()
+        )
+    except Exception:
+        logger.debug(
+            "Unable to read active intraday session.",
+            exc_info=True,
+        )
+
+    if active_session:
+
+        mode = active_session.get(
+            "mode",
+            "DAILY",
+        )
+
+        session_date = active_session.get(
+            "session_date",
+            "unknown",
+        )
+
+        return (
+            "🟢 ON",
+            (
+                f"Mode: {escape(str(mode))}\n"
+                f"Date: {escape(str(session_date))}"
+            ),
+        )
+
+    return (
+        "🔴 OFF",
+        "No active Smart Intraday session.",
+    )
+
+
+def _get_sip_status() -> dict[str, Any]:
+
+    result = {
+        "active": False,
+        "target_count": 0,
+        "active_target_count": 0,
+        "paused_target_count": 0,
+    }
+
+    if SIP_ENGINE is None:
+        return result
+
+    try:
+
+        status_method = getattr(
+            SIP_ENGINE,
+            "status",
+            None,
+        )
+
+        if callable(status_method):
+
+            snapshot = status_method()
+
+            if isinstance(
+                snapshot,
+                dict,
+            ):
+
+                result.update(
+                    snapshot
                 )
 
-        total_pnl = total_current - total_invested
-        total_pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0.0
-        pnl_overall_icon = "🟢" if total_pnl >= 0 else "🔴"
+                return result
 
-        available_cash = 0.0
-        if rms_res and rms_res.get("status") and rms_res.get("data"):
-            available_cash = float(rms_res["data"].get("net", 0.0))
+    except Exception:
 
-        db.log_portfolio_snapshot(available_cash, total_invested, total_current, total_pnl)
-
-        holdings_str = "\n".join(holding_details) if holding_details else "<i>No active holdings.</i>"
-
-        msg = (
-            "<b>📊 LIVE PORTFOLIO TELEMETRY</b>\n"
-            "-------------------------------------\n"
-            f"💰 <b>Available Cash:</b> ₹{available_cash:,.2f}\n"
-            f"💼 <b>Total Invested:</b> ₹{total_invested:,.2f}\n"
-            f"📈 <b>Current Value:</b> ₹{total_current:,.2f}\n"
-            f"{pnl_overall_icon} <b>Total Realized P&amp;L:</b> ₹{total_pnl:,.2f} ({total_pnl_pct:+.2f}%)\n"
-            "-------------------------------------\n"
-            "<b>Active Positions:</b>\n"
-            f"{holdings_str}"
+        logger.debug(
+            "Unable to read SIP status snapshot.",
+            exc_info=True,
         )
 
-        logger.info("Fetched live portfolio telemetry for /portfolio command.")
-        await update.message.reply_text(msg, parse_mode="HTML")
+    return result
 
-    except Exception as e:
-        logger.error(f"Failed to pull live portfolio for Telegram: {e}")
-        send_critical_failure_alert(f"Portfolio Fetch Exception: {e}")
-        await update.message.reply_text(
-            f"❌ <b>Error pulling live portfolio:</b> <code>{str(e)}</code>",
-            parse_mode="HTML"
-        )
 
-async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
+async def cmd_status(
+    update,
+    context,
+):
 
-    await update.message.reply_text("👑 <i>Fetching live Gold & Precious Metals telemetry...</i>", parse_mode="HTML")
+    runtime_status = _runtime_status_text()
 
-    try:
-        client = get_active_smart_client()
-        gold_data = fetch_gold_data(smart_client=client)
-        msg = format_gold_message(gold_data)
-
-        logger.info("Successfully fetched gold telemetry via gold.py module.")
-        await update.message.reply_text(msg, parse_mode="HTML")
-
-    except Exception as e:
-        logger.error(f"Failed to fetch gold pricing telemetry via gold.py: {e}")
-        await update.message.reply_text(
-            f"❌ <b>Error fetching gold telemetry:</b> <code>{str(e)}</code>",
-            parse_mode="HTML"
-        )
-
-async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
-        return
-
-    if not context.args:
-        await update.message.reply_text(
-            "<b>Usage:</b> <code>/analyze TICKER</code> or <code>/predict TICKER</code>\n"
-            "<i>Examples:</i> <code>/analyze TATAMOTORS</code> or <code>/predict RELIANCE</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    raw_symbol = context.args[0].upper().strip()
-    clean_symbol = clean_ticker_symbol(raw_symbol)
-
-    await update.message.reply_text(
-        f"🔍 <i>Analyzing market data for <b>{clean_symbol}</b>...</i>",
-        parse_mode="HTML"
+    market_status = (
+        "🟢 OPEN"
+        if _market_is_open()
+        else "🔴 CLOSED"
     )
 
-    try:
-        df = yf.download(clean_symbol, period="6mo", progress=False)
-        if df is None or df.empty:
-            await update.message.reply_text(
-                f"❌ Could not retrieve price data for <code>{clean_symbol}</code>. Please check ticker symbol.",
-                parse_mode="HTML"
-            )
-            return
+    intraday_status, intraday_details = (
+        _get_intraday_status()
+    )
 
-        if hasattr(df.columns, 'levels') and len(df.columns.levels) > 1:
-            try:
-                df = df.xs(clean_symbol, level=1, axis=1)
-            except Exception:
-                df.columns = df.columns.get_level_values(0)
+    sip_status = _get_sip_status()
 
-        from decision_engine import analyze_ticker_data
-        metrics = analyze_ticker_data(df)
-
-        if not metrics:
-            await update.message.reply_text(
-                f"⚠️ Insufficient technical data to evaluate <code>{clean_symbol}</code>.",
-                parse_mode="HTML"
-            )
-            return
-
-        price = metrics.get("price", 0.0)
-        rsi = metrics.get("rsi", 50.0)
-        macd = metrics.get("macd", 0.0)
-        signals = metrics.get("signals", [])
-        sig_str = ", ".join(signals) if signals else "NEUTRAL"
-
-        if rsi < 50.0 or "MACD_BULLISH_CROSS" in signals:
-            recommendation = "🟢 BUY"
-            reasoning = f"Bullish bias (RSI {rsi:.1f} &lt; 50 or MACD structure)."
-            tsl = price * 0.98
-            tp = price * 1.05
-        else:
-            recommendation = "🔴 SELL"
-            reasoning = f"Bearish / profit-taking bias (RSI {rsi:.1f} &gt;= 50 or MACD exhaustion)."
-            tsl = price * 1.02
-            tp = price * 0.95
-
-        db.log_signal(clean_symbol, recommendation, price, rsi, macd, recommendation.split()[-1])
-
-        report = (
-            f"<b>📊 TECHNICAL ANALYSIS: {clean_symbol}</b>\n\n"
-            f"• <b>Current Price:</b> ₹{price:,.2f}\n"
-            f"• <b>Stop Loss (TSL -2%):</b> ₹{tsl:,.2f}\n"
-            f"• <b>Target Price (TP +5%):</b> ₹{tp:,.2f}\n"
-            f"• <b>RSI (14):</b> {rsi:.1f}\n"
-            f"• <b>MACD Value:</b> {macd:.2f}\n"
-            f"• <b>Active Signals:</b> <code>{sig_str}</code>\n\n"
-            f"💡 <b>RECOMMENDATION:</b> <code>{recommendation}</code>\n"
-            f"📝 <b>Reasoning:</b> {reasoning}\n\n"
-            f"<i>Note: Analysis calculated independently of wallet balance.</i>"
+    sip_active = bool(
+        sip_status.get(
+            "active",
+            False,
         )
-        await update.message.reply_text(report, parse_mode="HTML")
+    )
 
-    except Exception as e:
-        logger.error(f"Failed to analyze stock command for {clean_symbol}: {e}")
-        send_critical_failure_alert(f"Analysis Error on {clean_symbol}: {e}")
+    sip_status_text = (
+        "🟢 ACTIVE"
+        if sip_active
+        else "🔴 DORMANT"
+    )
+
+    target_count = int(
+        sip_status.get(
+            "target_count",
+            0,
+        )
+        or 0
+    )
+
+    active_target_count = int(
+        sip_status.get(
+            "active_target_count",
+            0,
+        )
+        or 0
+    )
+
+    paused_target_count = int(
+        sip_status.get(
+            "paused_target_count",
+            0,
+        )
+        or 0
+    )
+
+    suspend_line = ""
+
+    if is_suspended():
+
+        until = get_suspend_until()
+
+        if until:
+            suspend_line = (
+                f"\nResume: "
+                f"{until.strftime('%H:%M:%S IST')}"
+            )
+
+    await update.message.reply_text(
+        (
+            "<b>ASTRA Status</b>\n"
+            "\n"
+            f"Status: {runtime_status}\n"
+            f"Stock Market: {market_status}\n"
+            "Telegram Bot: 🟢 ACTIVE"
+            f"{suspend_line}\n"
+
+            "\n<b>Smart Intraday</b>\n"
+            f"Status: {intraday_status}\n"
+            f"{intraday_details}\n"
+
+            "\n<b>SIP</b>\n"
+            f"Status: {sip_status_text}\n"
+            f"Targets: {target_count} | "
+            f"Active: {active_target_count} | "
+            f"Paused: {paused_target_count}"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ======================================================================
+# /portfolio
+# ======================================================================
+
+async def cmd_portfolio(
+    update,
+    context,
+):
+
+    if SMART_CLIENT is None:
+
         await update.message.reply_text(
-            f"❌ Error analyzing <code>{clean_symbol}</code>: {str(e)}",
-            parse_mode="HTML"
+            "❌ Shared Angel One client unavailable."
         )
 
-async def handle_unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if IS_SUSPENDED:
+        return
+
+    try:
+
+        wallet = (
+            SMART_CLIENT
+            .get_real_portfolio_data()
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram portfolio request failed."
+        )
+
+        await update.message.reply_text(
+            (
+                "❌ Wallet request failed: "
+                f"{escape(str(exc))}"
+            )
+        )
+
+        return
+
+    if wallet is None:
+
+        await update.message.reply_text(
+            (
+                "❌ Wallet unavailable.\n\n"
+                "ASTRA did not interpret this as ₹0."
+            )
+        )
+
+        return
+
+    cash = float(
+        wallet.get(
+            "available_cash",
+            0.0,
+        )
+        or 0.0
+    )
+
+    holdings = wallet.get(
+        "holdings",
+        [],
+    ) or []
+
+    await update.message.reply_text(
+        (
+            "<b>ASTRA Wallet</b>\n\n"
+            f"Available cash: ₹{cash:,.2f}\n"
+            f"Holdings: {len(holdings)}"
+        ),
+        parse_mode="HTML",
+    )
+
+
+# ======================================================================
+# /analyze
+# ======================================================================
+
+async def cmd_analyze(
+    update,
+    context,
+):
+
+    if await _reject_operational_command(
+        update
+    ):
         return
 
     await update.message.reply_text(
-        "Command unrecognized. Type <code>/help</code> for available commands.",
-        parse_mode="HTML"
+        (
+            "Use ASTRA's normal market cycle "
+            "for technical analysis."
+        )
     )
+
+
+# ======================================================================
+# /config
+# ======================================================================
+
+async def cmd_config(
+    update,
+    context,
+):
+    """Show the persistent runtime settings exposed through /set."""
+
+    try:
+        settings = get_settings()
+    except SettingsError as exc:
+        logger.exception("Unable to load settings for /config")
+        await update.message.reply_text(
+            f"❌ Unable to load settings.json: {escape(str(exc))}",
+            parse_mode="HTML",
+        )
+        return
+
+    lines = [
+        "<b>ASTRA Runtime Configuration</b>",
+        "",
+    ]
+
+    for section_name, section in settings.items():
+        if not isinstance(section, dict):
+            lines.append(
+                f"<b>{escape(str(section_name))}</b>: "
+                f"<code>{escape(_format_config_value(section))}</code>"
+            )
+            continue
+
+        lines.append(f"<b>[{escape(str(section_name))}]</b>")
+
+        for key, value in section.items():
+            lines.append(
+                f"  <b>{escape(str(key))}</b>: "
+                f"<code>{escape(_format_config_value(value))}</code>"
+            )
+
+        lines.append("")
+
+    lines.extend(
+        [
+            "<i>/set requires the TELEGRAM_PASSWORD from .env.</i>",
+            "<i>Changes are persisted to settings.json.</i>",
+            "<i>Critical secrets in .env are never displayed here.</i>",
+        ]
+    )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+# ======================================================================
+# SIP
+# ======================================================================
+
+def _sip_help_text() -> str:
+
+    return (
+        "<b>SIP Commands</b>\n\n"
+        "/SIP — activate SIP runtime\n"
+        "/SIP --STATUS — show SIP status\n"
+        "/SIP --LIST — list SIP targets\n"
+        "/SIP --CANCEL &lt;TARGET_ID&gt; — cancel target\n"
+        "/SIP --PAUSE &lt;TARGET_ID&gt; — pause target\n"
+        "/SIP --RESUME &lt;TARGET_ID&gt; — resume target"
+    )
+
+
+def _sip_target_to_dict(
+    target: Any,
+) -> dict[str, Any]:
+
+    if isinstance(
+        target,
+        dict,
+    ):
+        return dict(target)
+
+    if hasattr(
+        target,
+        "to_dict",
+    ) and callable(
+        target.to_dict
+    ):
+
+        try:
+            return dict(
+                target.to_dict()
+            )
+        except Exception:
+            pass
+
+    result: dict[str, Any] = {}
+
+    for name in (
+        "target_id",
+        "asset",
+        "amount",
+        "frequency",
+        "start_at",
+        "expires_at",
+        "status",
+        "created_at",
+        "next_execution_at",
+        "completed_contributions",
+        "total_invested",
+        "last_contribution_at",
+        "last_execution_price",
+        "last_execution_quantity",
+        "last_order_id",
+        "pnl",
+        "pnl_pct",
+    ):
+
+        if hasattr(
+            target,
+            name,
+        ):
+
+            value = getattr(
+                target,
+                name,
+            )
+
+            if isinstance(
+                value,
+                (dt.datetime, dt.date, dt.time),
+            ):
+                value = value.isoformat()
+
+            result[name] = value
+
+    return result
+
+
+def _get_sip_targets() -> list[dict[str, Any]]:
+
+    if SIP_ENGINE is None:
+        return []
+
+    getter = getattr(
+        SIP_ENGINE,
+        "get_targets",
+        None,
+    )
+
+    if not callable(getter):
+        return []
+
+    try:
+
+        targets = getter(
+            include_expired=True
+        )
+
+    except TypeError:
+
+        targets = getter()
+
+    except Exception:
+
+        logger.exception(
+            "Unable to list SIP targets."
+        )
+
+        return []
+
+    return [
+        _sip_target_to_dict(target)
+        for target in (
+            targets or []
+        )
+    ]
+
+
+async def _sip_status_command(
+    update,
+):
+
+    status = _get_sip_status()
+
+    active = bool(
+        status.get(
+            "active",
+            False,
+        )
+    )
+
+    await update.message.reply_text(
+        (
+            "<b>SIP Status</b>\n\n"
+            f"Runtime: "
+            f"{'🟢 ACTIVE' if active else '🔴 DORMANT'}\n"
+            f"Targets: "
+            f"{status.get('target_count', 0)}\n"
+            f"Active: "
+            f"{status.get('active_target_count', 0)}\n"
+            f"Paused: "
+            f"{status.get('paused_target_count', 0)}"
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def _sip_list_command(
+    update,
+):
+
+    targets = _get_sip_targets()
+
+    if not targets:
+
+        await update.message.reply_text(
+            (
+                "<b>SIP Targets</b>\n\n"
+                "No SIP targets found."
+            ),
+            parse_mode="HTML",
+        )
+
+        return
+
+    lines = [
+        "<b>SIP Targets</b>",
+        "",
+    ]
+
+    for target in targets:
+
+        target_id = str(
+            target.get(
+                "target_id",
+                "UNKNOWN",
+            )
+        )
+
+        asset = str(
+            target.get(
+                "asset",
+                "UNKNOWN",
+            )
+        )
+
+        amount = target.get(
+            "amount",
+            0,
+        )
+
+        frequency = str(
+            target.get(
+                "frequency",
+                "UNKNOWN",
+            )
+        )
+
+        status = str(
+            target.get(
+                "status",
+                "UNKNOWN",
+            )
+        )
+
+        lines.append(
+            (
+                f"• <b>{escape(target_id)}</b>\n"
+                f"  Asset: {escape(asset)}\n"
+                f"  Amount: ₹{float(amount):,.2f}\n"
+                f"  Frequency: {escape(frequency)}\n"
+                f"  Status: {escape(status)}"
+            )
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+    )
+
+
+async def _sip_target_action(
+    update,
+    action: str,
+    target_id: str,
+):
+
+    if SIP_ENGINE is None:
+
+        await update.message.reply_text(
+            "❌ Shared SIP engine unavailable."
+        )
+
+        return
+
+    method_name = {
+        "cancel": "cancel_target",
+        "pause": "pause_target",
+        "resume": "resume_target",
+    }.get(action)
+
+    if method_name is None:
+
+        await update.message.reply_text(
+            "❌ Unsupported SIP action."
+        )
+
+        return
+
+    method = getattr(
+        SIP_ENGINE,
+        method_name,
+        None,
+    )
+
+    if not callable(method):
+
+        await update.message.reply_text(
+            (
+                f"❌ SIP engine does not expose "
+                f"{method_name}()."
+            )
+        )
+
+        return
+
+    try:
+
+        result = method(
+            target_id
+        )
+
+        if result is False:
+
+            await update.message.reply_text(
+                (
+                    f"❌ Failed to {action} "
+                    f"SIP target <code>{escape(target_id)}</code>."
+                ),
+                parse_mode="HTML",
+            )
+
+            return
+
+        await update.message.reply_text(
+            (
+                f"🟢 SIP target "
+                f"<code>{escape(target_id)}</code> "
+                f"{action}ed."
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "SIP %s failed for %s.",
+            action,
+            target_id,
+        )
+
+        await update.message.reply_text(
+            (
+                f"❌ Failed to {action} SIP target: "
+                f"{escape(str(exc))}"
+            )
+        )
+
+
+async def cmd_sip(
+    update,
+    context,
+):
+
+    args = [
+        str(arg)
+        for arg in (
+            getattr(
+                context,
+                "args",
+                [],
+            )
+            or []
+        )
+    ]
+
+    if not args:
+
+        if await _reject_operational_command(
+            update,
+            "sip",
+        ):
+            return
+
+        if SIP_ENGINE is None:
+
+            await update.message.reply_text(
+                "❌ Shared SIP engine unavailable."
+            )
+
+            return
+
+        try:
+
+            activate = getattr(
+                SIP_ENGINE,
+                "activate",
+                None,
+            )
+
+            if not callable(activate):
+
+                await update.message.reply_text(
+                    "❌ SIP engine cannot be activated."
+                )
+
+                return
+
+            result = activate()
+
+            await update.message.reply_text(
+                (
+                    "🟢 <b>SIP runtime activated.</b>\n\n"
+                    "SIP recommendations are now enabled.\n"
+                    "Existing SIP monitoring remains active."
+                ),
+                parse_mode="HTML",
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "SIP activation failed."
+            )
+
+            await update.message.reply_text(
+                (
+                    "❌ SIP activation failed: "
+                    f"{escape(str(exc))}"
+                )
+            )
+
+        return
+
+    option = args[0].strip().lower()
+
+    if option in {
+        "--help",
+        "-h",
+        "help",
+    }:
+
+        await update.message.reply_text(
+            _sip_help_text(),
+            parse_mode="HTML",
+        )
+
+        return
+
+    if option == "--status":
+
+        await _sip_status_command(
+            update
+        )
+
+        return
+
+    if option == "--list":
+
+        await _sip_list_command(
+            update
+        )
+
+        return
+
+    if option in {
+        "--cancel",
+        "--pause",
+        "--resume",
+    }:
+
+        if await _reject_operational_command(
+            update,
+            "sip",
+        ):
+            return
+
+        if len(args) != 2:
+
+            await update.message.reply_text(
+                (
+                    f"❌ Target ID required.\n\n"
+                    f"/SIP {args[0]} &lt;TARGET_ID&gt;"
+                ),
+                parse_mode="HTML",
+            )
+
+            return
+
+        action = option[2:]
+
+        await _sip_target_action(
+            update,
+            action,
+            args[1],
+        )
+
+        return
+
+    await update.message.reply_text(
+        (
+            "❌ Unknown SIP option.\n\n"
+            "Use /SIP --HELP."
+        )
+    )
+
+
+# ======================================================================
+# Hidden /gold
+# ======================================================================
+
+async def cmd_gold(
+    update,
+    context,
+):
+
+    try:
+
+        from gold import (
+            fetch_gold_data,
+            format_gold_message,
+        )
+
+        data = fetch_gold_data(
+            SMART_CLIENT
+        )
+
+        message = format_gold_message(
+            data
+        )
+
+        await update.message.reply_text(
+            message,
+            parse_mode="HTML",
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Telegram /gold failed."
+        )
+
+        await update.message.reply_text(
+            (
+                "❌ Precious metals telemetry failed: "
+                f"{escape(str(exc))}"
+            )
+        )
+
+
+# ======================================================================
+# Unknown messages
+# ======================================================================
+
+async def handle_unknown_text(
+    update,
+    context,
+):
+
+    await update.message.reply_text(
+        "Unknown command. Use /help."
+    )
+
+
+# ======================================================================
+# Compatibility
+# ======================================================================
+
+def init_env_backup():
+    """
+    Kept for compatibility with older ASTRA code.
+
+    Runtime commands never modify .env.
+    """
+
+    return None
+
+
+# ======================================================================
+# Telegram runtime
+# ======================================================================
 
 def run_telegram_bot_loop():
-    init_env_backup()
+    """Start the python-telegram-bot polling loop."""
 
-    token = get_env_val("TELEGRAM_BOT_TOKEN")
+    global TELEGRAM_ACTIVE
+
+    token = get_env(
+        "TELEGRAM_BOT_TOKEN"
+    )
+
     if not token:
-        logger.error("TELEGRAM_BOT_TOKEN missing in .env. Cannot start Telegram listener.")
+
+        logger.warning(
+            "TELEGRAM_BOT_TOKEN is not configured. "
+            "Telegram bot disabled."
+        )
+
         return
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    try:
 
-    app = Application.builder().token(token).build()
+        from telegram.ext import (
+            Application,
+            CommandHandler,
+            MessageHandler,
+            filters,
+        )
 
-    app.add_handler(CommandHandler(["start", "help"], cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler(["sheet", "spreadsheet"], cmd_sheet))
-    app.add_handler(CommandHandler(["config", "cfg"], cmd_config))
-    app.add_handler(CommandHandler("set", cmd_set))
-    app.add_handler(CommandHandler(["restore_default", "restore"], cmd_restore_default))
-    app.add_handler(CommandHandler("suspend", cmd_suspend))
-    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-    app.add_handler(CommandHandler("gold", cmd_gold))
-    app.add_handler(CommandHandler("analyze", cmd_analyze))
+    except ImportError:
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown_text))
+        logger.error(
+            "python-telegram-bot is not installed."
+        )
 
-    logger.info("🤖 Telegram CLI Command Listener active and polling...")
-    app.run_polling(drop_pending_updates=True, stop_signals=None)
+        return
+
+    try:
+
+        app = (
+            Application
+            .builder()
+            .token(token)
+            .build()
+        )
+
+        # --------------------------------------------------------------
+        # Core
+        # --------------------------------------------------------------
+
+        app.add_handler(
+            CommandHandler(
+                "help",
+                cmd_help,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "status",
+                cmd_status,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "portfolio",
+                cmd_portfolio,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "analyze",
+                cmd_analyze,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "config",
+                cmd_config,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "cfg",
+                cmd_config,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # Smart Intraday
+        # --------------------------------------------------------------
+
+        app.add_handler(
+            CommandHandler(
+                "intraday",
+                cmd_intraday,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # Runtime control
+        # --------------------------------------------------------------
+
+        app.add_handler(
+            CommandHandler(
+                "kill",
+                cmd_kill,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "start",
+                cmd_start,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "suspend",
+                cmd_suspend,
+            )
+        )
+
+        app.add_handler(
+            CommandHandler(
+                "set",
+                cmd_set,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # SIP
+        # --------------------------------------------------------------
+
+        app.add_handler(
+            CommandHandler(
+                "sip",
+                cmd_sip,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # Hidden command
+        # --------------------------------------------------------------
+
+        app.add_handler(
+            CommandHandler(
+                "gold",
+                cmd_gold,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # Plain text
+        # --------------------------------------------------------------
+
+        app.add_handler(
+            MessageHandler(
+                filters.TEXT
+                & ~filters.COMMAND,
+                handle_unknown_text,
+            )
+        )
+
+        TELEGRAM_ACTIVE = True
+
+        logger.info(
+            "Telegram polling started."
+        )
+
+        app.run_polling(
+            drop_pending_updates=True,
+            stop_signals=None,
+        )
+
+    except Exception:
+
+        TELEGRAM_ACTIVE = False
+
+        logger.exception(
+            "Telegram bot stopped unexpectedly."
+        )
