@@ -49,17 +49,17 @@ rather than:
 
 ```text
                          ┌───────────────────────────┐
-                         │       Angel One            │
-                         │        SmartAPI            │
-                         │   Authentication / Wallet  │
-                         │      / Holdings Data       │
+                         │       Angel One           │
+                         │        SmartAPI           │
+                         │   Authentication / Wallet │
+                         │      / Holdings Data      │
                          └─────────────┬─────────────┘
                                        │
                                        ▼
                          ┌───────────────────────────┐
-                         │      ASTRA Main Loop       │
-                         │        main.py             │
-                         │ Scheduler / Orchestrator   │
+                         │      ASTRA Main Loop      │
+                         │        main.py            │
+                         │ Scheduler / Orchestrator  │
                          └─────────────┬─────────────┘
                                        │
              ┌─────────────────────────┼─────────────────────────┐
