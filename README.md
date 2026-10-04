@@ -1,5 +1,7 @@
 # ASTRA (Autonomous System for Trading & Risk Analysis)
 
+![version](https://img.shields.io/badge/ASTRA-V3-brightgreen?style=plastic)
+
 ASTRA is a lightweight, local **market-analysis, risk-analysis, telemetry, and alerting system** designed primarily for Indian Equity Markets (NSE).
 
 ASTRA continuously analyzes market data, evaluates technical indicators, monitors portfolio state, tracks risk metrics, generates advisory BUY/SELL signals, manages persistent telemetry, and communicates system status through Telegram, email, and Google Sheets.
