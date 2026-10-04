@@ -1567,14 +1567,6 @@ Also check:
 
 ---
 
-# 28. Repository
-
-Main repository:
-
-https://github.com/srijan-76448/ASTRA-V1
-
----
-
 ## License
 
 Add the project's applicable license information here if/when a formal license is selected.
