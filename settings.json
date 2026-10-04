@@ -1,0 +1,40 @@
+{
+    "ASTRA_FUNCTIONS": {
+        "ACTIVE_CYCLE_BUFFER": 5,
+        "PASSIVE_CYCLE_BUFFER": 15,
+        "NOTIFICATION_REPEAT_BUFFER": 6,
+        "PASSIVE_WALLET_REFRESH_BUFFER": 30,
+        "KILL": false
+    },
+    "NORMAL_TRADING": {
+        "TICKERS_COUNT": 50,
+        "MIN_TRADE_ALLOCATION": 100,
+        "MAX_TRADE_ALLOCATION": 500,
+        "PORTFOLIO_ALLOCATION_PCT": 0.1,
+        "RSI_LOWER_THRESHOLD": 35,
+        "RSI_UPPER_THRESHOLD": 65,
+        "ENABLE_TRAILING_STOP": true,
+        "STOP_LOSS_PCT": 0.05,
+        "TRAILING_STOP_PCT": 0.04
+    },
+    "INTRADAY": {
+        "TRADING_ENGINE": false,
+        "LIVE_TRADING": false,
+        "TICKERS_COUNT": 50,
+        "SCAN_INTERVAL_SECONDS": 180,
+        "RSI_LOWER_THRESHOLD": 35,
+        "RSI_UPPER_THRESHOLD": 65,
+        "MIN_ALLOCATION": 100,
+        "MAX_ALLOCATION": 500,
+        "MAX_POSITIONS": 5,
+        "MAX_DAILY_LOSS": 0.02,
+        "STOP_LOSS_PCT": 0.03,
+        "TRAILING_STOP_PCT": 0.02,
+        "FORCE_EXIT_TIME": "15:30"
+    },
+    "mailer": {
+        "TIME": "EOW"
+    },
+    "SIP": {},
+    "IPO": {}
+}
