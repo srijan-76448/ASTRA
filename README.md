@@ -1,6 +1,6 @@
 # ASTRA (Autonomous System for Trading & Risk Analysis)
 
-![version](https://img.shields.io/badge/ASTRA-V3-red?style=plastic)
+![version](https://img.shields.io/badge/ASTRA-V3-darkred?style=plastic)
 
 ASTRA is a lightweight, local **market-analysis, risk-analysis, telemetry, and alerting system** designed primarily for Indian Equity Markets (NSE).
 
