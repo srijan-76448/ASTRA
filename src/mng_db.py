@@ -134,7 +134,7 @@ def _configured_db_path() -> Path:
 #
 # Version 2:
 #     Adds V3 SIP persistence tables.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 # ============================================================================
@@ -356,6 +356,7 @@ class DatabaseManager:
         try:
             with self._connection() as conn:
                 self._create_schema(conn)
+                self._migrate_schema(conn)
                 self._set_schema_version(conn)
 
             logger.info(
@@ -506,7 +507,45 @@ class DatabaseManager:
 
 
             -- ============================================================
-            -- ASTRA V3: SIP TARGETS
+            -- ASTRA V2: INTRADAY HOLDINGS
+    --
+    -- This table is the authoritative ASTRA ownership ledger for
+    -- Smart Intraday positions. It is deliberately separate from
+    -- broker aggregate holdings and from intraday_candidates.
+    --
+    CREATE TABLE IF NOT EXISTS intraday_holdings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        entry_price REAL NOT NULL,
+        current_price REAL NOT NULL,
+        stop_loss REAL NOT NULL,
+        trailing_stop REAL NOT NULL,
+        peak_price REAL NOT NULL,
+        session_date TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        entry_order_id TEXT,
+        exit_order_id TEXT,
+        exit_price REAL,
+        exit_reason TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        closed_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_intraday_holdings_owner_status
+        ON intraday_holdings(owner, status);
+
+    CREATE INDEX IF NOT EXISTS idx_intraday_holdings_ticker_owner_status
+        ON intraday_holdings(ticker, owner, status);
+
+    CREATE INDEX IF NOT EXISTS idx_intraday_holdings_session_date
+        ON intraday_holdings(session_date);
+
+
+    -- ============================================================
+    -- ASTRA V3: SIP TARGETS
             -- ============================================================
 
             CREATE TABLE IF NOT EXISTS sip_targets (
@@ -642,6 +681,78 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_sip_decisions_decision
                 ON sip_decisions(decision);
             """
+        )
+
+    @staticmethod
+    def _migrate_schema(
+        conn: sqlite3.Connection,
+    ) -> None:
+        """
+        Apply additive migrations required by newer ASTRA releases.
+
+        ``CREATE TABLE IF NOT EXISTS`` deliberately does not modify an
+        already-existing SQLite table.  Older ASTRA databases may therefore
+        contain an ``intraday_holdings`` table created before the timestamp
+        and exit-tracking columns were introduced.  Querying those columns
+        would otherwise raise ``sqlite3.OperationalError: no such column``.
+
+        All migrations here are additive and preserve existing rows.
+        """
+
+        def columns(table: str) -> set[str]:
+            rows = conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+            return {str(row[1]) for row in rows}
+
+        table_columns = columns("intraday_holdings")
+
+        if not table_columns:
+            # The CREATE TABLE statement above should have created this
+            # table.  If it is still missing, fail loudly instead of allowing
+            # later intraday queries to produce confusing "no such column"
+            # errors.
+            raise sqlite3.OperationalError(
+                "intraday_holdings table is missing after schema creation"
+            )
+
+        # Columns introduced by the current intraday ownership ledger.
+        # Nullable additions are intentional so existing rows remain valid.
+        additions: dict[str, str] = {
+            "exit_order_id": "TEXT",
+            "exit_price": "REAL",
+            "exit_reason": "TEXT",
+            "created_at": "TEXT",
+            "updated_at": "TEXT",
+            "closed_at": "TEXT",
+        }
+
+        for name, definition in additions.items():
+            if name in table_columns:
+                continue
+
+            conn.execute(
+                f"ALTER TABLE intraday_holdings ADD COLUMN {name} {definition}"
+            )
+
+            logger.info(
+                "SQLite migration: added intraday_holdings.%s",
+                name,
+            )
+
+        # Backfill timestamps for rows created by an older schema.  These
+        # rows are historical/open ownership records, so preserving them is
+        # preferable to deleting or recreating the table.
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            UPDATE intraday_holdings
+            SET created_at = COALESCE(created_at, ?),
+                updated_at = COALESCE(updated_at, ?)
+            WHERE created_at IS NULL
+               OR updated_at IS NULL
+            """,
+            (now, now),
         )
 
     @staticmethod
@@ -1067,6 +1178,262 @@ class DatabaseManager:
             )
 
             return None
+
+    # ========================================================================
+    # INTRADAY HOLDINGS
+    # ========================================================================
+
+    def get_open_intraday_holdings(
+        self,
+        owner: str = "ASTRA_INTRADAY",
+    ) -> list[dict[str, Any]]:
+        """Return all open ASTRA-owned intraday holdings for an owner."""
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        id, ticker, quantity, entry_price, current_price,
+                        stop_loss, trailing_stop, peak_price, session_date,
+                        owner, status, entry_order_id, exit_order_id,
+                        exit_price, exit_reason, created_at, updated_at,
+                        closed_at
+                    FROM intraday_holdings
+                    WHERE owner = ?
+                      AND status = 'OPEN'
+                      AND quantity > 0
+                    ORDER BY id ASC
+                    """,
+                    (str(owner),),
+                ).fetchall()
+
+            return [dict(row) for row in rows]
+
+        except sqlite3.Error:
+            logger.exception(
+                "Failed to read open intraday holdings for owner %s",
+                owner,
+            )
+            return []
+
+    def get_open_intraday_holding(
+        self,
+        ticker: str,
+        owner: str = "ASTRA_INTRADAY",
+    ) -> Optional[dict[str, Any]]:
+        """Return one open ASTRA-owned intraday holding."""
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT
+                        id, ticker, quantity, entry_price, current_price,
+                        stop_loss, trailing_stop, peak_price, session_date,
+                        owner, status, entry_order_id, exit_order_id,
+                        exit_price, exit_reason, created_at, updated_at,
+                        closed_at
+                    FROM intraday_holdings
+                    WHERE ticker = ?
+                      AND owner = ?
+                      AND status = 'OPEN'
+                      AND quantity > 0
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (str(ticker), str(owner)),
+                ).fetchone()
+
+            return dict(row) if row is not None else None
+
+        except sqlite3.Error:
+            logger.exception(
+                "Failed to read intraday holding for %s (%s)",
+                ticker,
+                owner,
+            )
+            return None
+
+    def open_intraday_holding(
+        self,
+        ticker: str,
+        quantity: int,
+        entry_price: float,
+        current_price: float,
+        stop_loss: float,
+        trailing_stop: float,
+        peak_price: float,
+        session_date: str,
+        owner: str = "ASTRA_INTRADAY",
+        entry_order_id: Optional[str] = None,
+        status: str = "OPEN",
+    ) -> Optional[int]:
+        """Persist a new ASTRA-owned intraday holding."""
+        now = self._utc_now()
+
+        try:
+            with self._connection() as conn:
+                existing = conn.execute(
+                    """
+                    SELECT id
+                    FROM intraday_holdings
+                    WHERE ticker = ?
+                      AND owner = ?
+                      AND status = 'OPEN'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (str(ticker), str(owner)),
+                ).fetchone()
+
+                if existing is not None:
+                    logger.warning(
+                        "Intraday holding already open for %s (%s); id=%s",
+                        ticker,
+                        owner,
+                        existing["id"],
+                    )
+                    return int(existing["id"])
+
+                cursor = conn.execute(
+                    """
+                    INSERT INTO intraday_holdings (
+                        ticker, quantity, entry_price, current_price,
+                        stop_loss, trailing_stop, peak_price, session_date,
+                        owner, status, entry_order_id, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(ticker),
+                        self._safe_int(quantity),
+                        self._safe_float(entry_price),
+                        self._safe_float(current_price),
+                        self._safe_float(stop_loss),
+                        self._safe_float(trailing_stop),
+                        self._safe_float(peak_price),
+                        str(session_date),
+                        str(owner),
+                        str(status).upper(),
+                        entry_order_id,
+                        now,
+                        now,
+                    ),
+                )
+
+                return int(cursor.lastrowid)
+
+        except sqlite3.Error:
+            logger.exception(
+                "Failed to open intraday holding for %s",
+                ticker,
+            )
+            return None
+
+    def update_intraday_holding(
+        self,
+        ticker: str,
+        owner: str = "ASTRA_INTRADAY",
+        quantity: Optional[int] = None,
+        current_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        trailing_stop: Optional[float] = None,
+        peak_price: Optional[float] = None,
+    ) -> bool:
+        """Update the live state of an open ASTRA intraday holding."""
+        updates: list[str] = []
+        values: list[Any] = []
+
+        if quantity is not None:
+            updates.append("quantity = ?")
+            values.append(self._safe_int(quantity))
+        if current_price is not None:
+            updates.append("current_price = ?")
+            values.append(self._safe_float(current_price))
+        if stop_loss is not None:
+            updates.append("stop_loss = ?")
+            values.append(self._safe_float(stop_loss))
+        if trailing_stop is not None:
+            updates.append("trailing_stop = ?")
+            values.append(self._safe_float(trailing_stop))
+        if peak_price is not None:
+            updates.append("peak_price = ?")
+            values.append(self._safe_float(peak_price))
+
+        if not updates:
+            return True
+
+        updates.append("updated_at = ?")
+        values.append(self._utc_now())
+        values.extend([str(ticker), str(owner)])
+
+        try:
+            with self._connection() as conn:
+                cursor = conn.execute(
+                    f"""
+                    UPDATE intraday_holdings
+                    SET {', '.join(updates)}
+                    WHERE ticker = ?
+                      AND owner = ?
+                      AND status = 'OPEN'
+                    """,
+                    tuple(values),
+                )
+
+                return cursor.rowcount > 0
+
+        except sqlite3.Error:
+            logger.exception(
+                "Failed to update intraday holding for %s",
+                ticker,
+            )
+            return False
+
+    def close_intraday_holding(
+        self,
+        ticker: str,
+        owner: str = "ASTRA_INTRADAY",
+        exit_price: Optional[float] = None,
+        exit_order_id: Optional[str] = None,
+        exit_reason: str = "UNKNOWN",
+    ) -> bool:
+        """Close an ASTRA-owned intraday holding without touching broker state."""
+        now = self._utc_now()
+
+        try:
+            with self._connection() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE intraday_holdings
+                    SET status = 'CLOSED',
+                        exit_price = ?,
+                        exit_order_id = ?,
+                        exit_reason = ?,
+                        closed_at = ?,
+                        updated_at = ?
+                    WHERE ticker = ?
+                      AND owner = ?
+                      AND status = 'OPEN'
+                    """,
+                    (
+                        self._safe_optional_float(exit_price),
+                        exit_order_id,
+                        str(exit_reason),
+                        now,
+                        now,
+                        str(ticker),
+                        str(owner),
+                    ),
+                )
+
+                return cursor.rowcount > 0
+
+        except sqlite3.Error:
+            logger.exception(
+                "Failed to close intraday holding for %s",
+                ticker,
+            )
+            return False
+
 
     # ========================================================================
     # INTRADAY CANDIDATES

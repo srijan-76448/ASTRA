@@ -28,17 +28,23 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import datetime as dt
 import signal
 import sys
 import threading
 import time
 from pathlib import Path
+
+from dotenv import load_dotenv
 from typing import Any, Optional
 
 import yfinance as yf
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / ".env", override=True)
+
 SRC_DIR = BASE_DIR / "src"
 
 if str(SRC_DIR) not in sys.path:
@@ -55,6 +61,10 @@ from telegram_bot import (
     run_telegram_bot_loop,
     send_investment_suggestion,
     set_smart_client,
+    set_intraday_engine_provider,
+    is_astra_killed,
+    is_suspended,
+    is_module_killed,
 )
 from tickers import get_dynamic_tickers
 from utils import (
@@ -85,6 +95,31 @@ MARKET_CLOSE = dt.time(
 )
 
 EOD_STATE_FILE = BASE_DIR / "logs" / "last_eod_sent.txt"
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    """Read a boolean infrastructure flag from .env."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if value in {"0", "false", "no", "off", "disabled"}:
+        return False
+    logging.getLogger("ASTRA_MAIN").warning(
+        "Invalid boolean value for %s=%r; using %s.",
+        key,
+        raw,
+        default,
+    )
+    return default
+
+
+ALWAYS_ACTIVE_INTRADAY = _env_bool(
+    "ALWAYS_ACTIVE_INTRADAY",
+    False,
+)
 
 # Wallet_and_Holdings is a fixed-width dashboard contract.  The Sheets
 # synchronization layer must never receive more than these eight holding
@@ -1867,9 +1902,9 @@ def start_telegram_listener() -> threading.Thread:
 # AUTONOMOUS INTRADAY PERIPHERAL
 # ---------------------------------------------------------------------------
 
-# The intraday bot is activated by Telegram, never by the CLI.  Main.py only
-# provides the long-running scheduler that gives the bot execution time and
-# performs the end-of-day square-off.
+# The intraday bot may be activated by Telegram or explicitly from the
+# terminal with ``--intraday``. Main.py provides the long-running scheduler
+# that gives the bot execution time and performs the end-of-day square-off.
 INTRADAY_EXPIRY_GRACE_SECONDS = max(
     5,
     _setting_int("INTRADAY.EXPIRY_GRACE_SECONDS", 30),
@@ -1877,17 +1912,11 @@ INTRADAY_EXPIRY_GRACE_SECONDS = max(
 
 
 def run_intraday_peripheral() -> None:
-    """Run one autonomous intraday step or perform the daily square-off.
+    """Run one Smart Intraday step and enforce the daily expiry boundary.
 
-    This function deliberately contains no signal-generation or order logic.
-    Those responsibilities belong to ``intraday_bot.py``. Main.py only
-    schedules the peripheral.
-
-    The square-off is triggered shortly before 15:30 because the current bot
-    session gate closes at exactly 15:30. This guarantees that the expiry path
-    is reached while the normal intraday execution window is still open. The
-    dedicated expiry path in intraday_bot.py remains responsible for selling
-    every ASTRA-owned position.
+    Telegram and main.py intentionally use the same process-wide
+    SmartIntradayBot instance. When ALWAYS_ACTIVE_INTRADAY=true, this
+    function activates that shared bot automatically during the NSE session.
     """
     try:
         bot = get_smart_intraday_bot(
@@ -1896,23 +1925,47 @@ def run_intraday_peripheral() -> None:
         )
         now = now_ist()
 
-        gate = getattr(bot, "gate", None)
-        if gate is not None:
-            try:
+        if now.weekday() >= 5:
+            return
+
+        # Respect global/module kill and temporary suspension controls.
+        blocked = (
+            is_astra_killed()
+            or is_suspended()
+            or is_module_killed("intraday")
+        )
+
+        # ---------------------------------------------------------------
+        # ALWAYS_ACTIVE_INTRADAY
+        # ---------------------------------------------------------------
+        if (
+            ALWAYS_ACTIVE_INTRADAY
+            and not blocked
+            and MARKET_OPEN <= now.timetz() < MARKET_CLOSE
+            and not bot.gate.allowed()
+        ):
+            activated = bot.activate(
+                now.date().isoformat()
+            )
+            if activated:
                 logger.info(
-                    "\033[1;38;2;0;255;0mIntraday state\033[0m: active=%s | allowed=%s | killed=%s | session_date=%s",
-                    bool(getattr(gate, "active", False)),
-                    bool(getattr(gate, "allowed", lambda: False)()),
-                    bool(getattr(gate, "killed", False)),
-                    getattr(gate, "session_date", None),
-                )
-            except Exception:
-                logger.debug(
-                    "Unable to read intraday state snapshot.",
-                    exc_info=True,
+                    "ALWAYS_ACTIVE_INTRADAY override activated Smart Intraday | session=%s | expiry=15:30 IST",
+                    now.date().isoformat(),
                 )
 
-        if now.weekday() >= 5:
+        state = bot.status()
+        logger.info(
+            "\033[1;38;2;0;255;0mIntraday state\033[0m: active=%s | killed=%s | session=%s | open_positions=%s | daily_pnl=%.2f | mode=%s",
+            state.get("active", False),
+            state.get("killed", False),
+            state.get("session_date"),
+            state.get("open_positions", 0),
+            float(state.get("daily_pnl", 0.0) or 0.0),
+            state.get("execution_mode", "ADVISORY"),
+        )
+
+        # Nothing further should run while globally/module-blocked.
+        if blocked:
             return
 
         expiry_start = (
@@ -1927,9 +1980,9 @@ def run_intraday_peripheral() -> None:
         # EOD square-off takes precedence over another strategy cycle.
         if now >= expiry_start:
             gate = getattr(bot, "gate", None)
-            if gate is not None and getattr(gate, "allowed", lambda: False)():
+            if gate is not None and getattr(gate, "expiry_allowed", lambda: False)():
                 logger.warning(
-                    "Intraday EOD window reached. Squaring off all ASTRA-owned positions..."
+                    "Intraday EOD window reached. Generating expiry SELL recommendations for all ASTRA-owned positions..."
                 )
                 results = bot.expire()
                 logger.info(
@@ -1938,15 +1991,16 @@ def run_intraday_peripheral() -> None:
                 )
             return
 
-        # run_cycle() itself is fail-closed when /intraday has not activated
-        # the session. Therefore main.py can safely call it every market cycle.
         result = bot.run_cycle()
         if result.get("status") not in {"BLOCKED", "OK"}:
-            logger.warning("Intraday peripheral returned: %s", result)
+            logger.warning(
+                "Intraday peripheral returned: %s",
+                result,
+            )
 
     except Exception as exc:
         logger.exception(
-            "Autonomous intraday peripheral failed: %s",
+            "Intraday peripheral failed: %s",
             exc,
         )
         try:
@@ -1966,6 +2020,8 @@ def run_intraday_peripheral() -> None:
 def run(
     *,
     force_email_now: bool = False,
+    cli_intraday: bool = False,
+    cli_sip: bool = False,
 ) -> int:
     """Run the ASTRA service until shutdown."""
     install_signal_handlers()
@@ -1974,7 +2030,76 @@ def run(
 
     global telegram_thread, sip_thread
 
+    # Register the shared SmartAPI client and the exact same intraday singleton
+    # with Telegram before polling starts. This removes the old split between
+    # ``intraday_trading`` and ``intraday_bot`` state machines.
+    try:
+        set_smart_client(angel_client)
+        set_intraday_engine_provider(
+            angel_client,
+            db,
+        )
+        logger.info(
+            "Shared Smart Intraday engine registered with main + Telegram."
+        )
+    except Exception:
+        logger.exception(
+            "Failed to register shared Smart Intraday engine."
+        )
+
     register_sip_runtime_provider()
+
+    # ------------------------------------------------------------------
+    # Console-only subsystem activation
+    # ------------------------------------------------------------------
+    # ``--intraday`` and ``--sip`` are explicit terminal overrides. They
+    # activate only the requested subsystem; normal ASTRA processing remains
+    # unchanged. Both flags may be supplied together.
+    if cli_intraday:
+        try:
+            bot = get_smart_intraday_bot(
+                angel_client,
+                db,
+            )
+            now = now_ist()
+
+            if now.weekday() >= 5:
+                logger.warning(
+                    "--intraday requested, but today is outside the NSE weekday session."
+                )
+            else:
+                expiry = dt.datetime.combine(
+                    now.date(),
+                    MARKET_CLOSE,
+                    tzinfo=IST,
+                )
+                bot.activate(
+                    now.date().isoformat(),
+                    expiry,
+                )
+                logger.info(
+                    "Console --intraday activation: ACTIVE | session=%s | expiry=%s",
+                    now.date().isoformat(),
+                    expiry.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                )
+        except Exception as exc:
+            logger.exception(
+                "Console --intraday activation failed: %s",
+                exc,
+            )
+
+    if cli_sip:
+        try:
+            activated = sip_engine.activate()
+            logger.info(
+                "Console --sip activation: %s",
+                "ACTIVE" if activated else "FAILED",
+            )
+        except Exception as exc:
+            logger.exception(
+                "Console --sip activation failed: %s",
+                exc,
+            )
 
     sip_thread = start_sip_runtime()
 
@@ -2119,6 +2244,23 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--intraday",
+        action="store_true",
+        help=(
+            "Activate the Smart Intraday subsystem from the terminal "
+            "for the current NSE session."
+        ),
+    )
+
+    parser.add_argument(
+        "--sip",
+        action="store_true",
+        help=(
+            "Activate the SIP subsystem from the terminal."
+        ),
+    )
+
     return parser
 
 
@@ -2128,6 +2270,8 @@ def main() -> int:
 
     return run(
         force_email_now=args.email_now,
+        cli_intraday=args.intraday,
+        cli_sip=args.sip,
     )
 
 

@@ -23,7 +23,9 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import os
 import re
+import types
 from html import escape
 from pathlib import Path
 from typing import Any, Optional
@@ -31,14 +33,6 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from mng_db import DatabaseManager
-from utils import (
-    SettingsError,
-    get_env as _utils_get_env,
-    get_setting,
-    get_settings,
-    save_settings,
-    update_setting,
-)
 
 
 BASE_DIR = (
@@ -73,8 +67,9 @@ SUSPEND_UNTIL: Optional[dt.datetime] = None
 
 MODULE_KILLS: set[str] = set()
 
-# Runtime settings are persisted in settings.json through utils.py.
-# Critical secrets remain in .env and are never exposed through /config or /set.
+# Runtime-only configuration overrides.
+# These never modify .env.
+RUNTIME_CONFIG: dict[str, str] = {}
 
 TELEGRAM_ACTIVE = False
 
@@ -99,21 +94,148 @@ def set_smart_client(
     SMART_CLIENT = client_instance
 
 
+def _intraday_expiry_for_session(
+    session_date: str,
+) -> str:
+    """Return the configured intraday expiry as an ISO-8601 IST timestamp."""
+
+    expiry_text = "15:30"
+
+    try:
+        from utils import get_setting
+
+        expiry_text = str(
+            get_setting(
+                "INTRADAY.FORCE_EXIT_TIME",
+                "15:30",
+            )
+        ).strip() or "15:30"
+    except Exception:
+        logger.debug(
+            "Unable to read INTRADAY.FORCE_EXIT_TIME; using 15:30 IST.",
+            exc_info=True,
+        )
+
+    try:
+        hour_text, minute_text = expiry_text.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+
+        from zoneinfo import ZoneInfo
+
+        expiry = dt.datetime(
+            *dt.date.fromisoformat(str(session_date)).timetuple()[:3],
+            hour,
+            minute,
+            tzinfo=ZoneInfo("Asia/Kolkata"),
+        )
+
+        return expiry.isoformat()
+
+    except Exception:
+        logger.warning(
+            "Invalid INTRADAY.FORCE_EXIT_TIME=%r; using 15:30 IST.",
+            expiry_text,
+        )
+
+        from zoneinfo import ZoneInfo
+
+        expiry = dt.datetime(
+            *dt.date.fromisoformat(str(session_date)).timetuple()[:3],
+            15,
+            30,
+            tzinfo=ZoneInfo("Asia/Kolkata"),
+        )
+
+        return expiry.isoformat()
+
+
+def _patch_intraday_session_database(
+    database,
+) -> None:
+    """
+    Keep older intraday activation code compatible with the current DB API.
+
+    Some Smart Intraday versions call create_intraday_session() with only
+    session_date, mode and started_at. The current DatabaseManager requires
+    expires_at as well. Supplying the configured expiry here keeps the
+    Telegram control plane compatible without weakening the database schema.
+    """
+
+    if database is None:
+        return
+
+    if getattr(
+        database,
+        "_astra_intraday_session_compat",
+        False,
+    ):
+        return
+
+    create_session = getattr(
+        database,
+        "create_intraday_session",
+        None,
+    )
+
+    if not callable(create_session):
+        return
+
+    def compatible_create_intraday_session(
+        session_date,
+        mode,
+        started_at,
+        expires_at=None,
+    ):
+        if expires_at is None:
+            expires_at = _intraday_expiry_for_session(
+                str(session_date)
+            )
+
+        return create_session(
+            session_date,
+            mode,
+            started_at,
+            expires_at,
+        )
+
+    database.create_intraday_session = (
+        types.MethodType(
+            lambda _self, session_date, mode, started_at, expires_at=None:
+                compatible_create_intraday_session(
+                    session_date,
+                    mode,
+                    started_at,
+                    expires_at,
+                ),
+            database,
+        )
+    )
+
+    database._astra_intraday_session_compat = True
+
+
 def set_intraday_engine_provider(
     client,
     database=None,
 ) -> None:
-    """Register the shared Smart Intraday engine."""
+    """Register the exact same Smart Intraday singleton used by main.py."""
 
     global INTRADAY_ENGINE
 
-    from intraday_trading import (
-        get_intraday_engine,
+    from intraday_bot import (
+        get_smart_intraday_bot,
     )
 
-    INTRADAY_ENGINE = get_intraday_engine(
+    database = database or db
+
+    INTRADAY_ENGINE = get_smart_intraday_bot(
         client,
-        database or db,
+        database,
+    )
+
+    logger.info(
+        "Shared Smart Intraday engine registered with Telegram runtime."
     )
 
 
@@ -139,75 +261,106 @@ def get_env(
     key: str,
     default: str = "",
 ) -> str:
-    """Return a critical environment value from .env/environment.
+    """Return a runtime override when present, otherwise .env."""
 
-    Runtime-configurable values belong to settings.json and must be accessed
-    through get_setting(). This helper intentionally does not provide a
-    settings.json fallback so secrets cannot accidentally migrate into the
-    runtime configuration layer.
-    """
+    if key in RUNTIME_CONFIG:
+        return RUNTIME_CONFIG[key]
 
-    value = _utils_get_env(key, default)
-    return value if value is not None else default
+    return os.getenv(
+        key,
+        default,
+    )
 
 
-def _get_setting_value(
-    path: str,
-    default: Any = None,
-) -> Any:
-    """Read a persistent runtime setting from settings.json."""
+def _env_bool(
+    key: str,
+    default: bool = False,
+) -> bool:
+    """Read a boolean infrastructure override from .env."""
 
-    try:
-        return get_setting(path, default)
-    except SettingsError as exc:
-        logger.error("Unable to read runtime setting %s: %s", path, exc)
+    raw = os.getenv(key)
+
+    if raw is None:
         return default
+
+    normalized = str(raw).strip().lower()
+
+    if normalized in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+    }:
+        return True
+
+    if normalized in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "disabled",
+    }:
+        return False
+
+    logger.warning(
+        "Invalid boolean value for %s=%r; using %s.",
+        key,
+        raw,
+        default,
+    )
+
+    return default
+
+
+ALWAYS_ACTIVE_INTRADAY = _env_bool(
+    "ALWAYS_ACTIVE_INTRADAY",
+    False,
+)
+
+ALWAYS_ACTIVE_SIP = _env_bool(
+    "ALWAYS_ACTIVE_SIP",
+    False,
+)
+
+ALWAYS_ACTIVE_IPO = _env_bool(
+    "ALWAYS_ACTIVE_IPO",
+    False,
+)
 
 
 def _get_int(
-    path: str,
+    key: str,
     default: int,
 ) -> int:
+
     try:
-        return int(_get_setting_value(path, default))
+        return int(
+            get_env(
+                key,
+                str(default),
+            )
+        )
+
     except (TypeError, ValueError):
         return default
 
 
 def _get_float(
-    path: str,
+    key: str,
     default: float,
 ) -> float:
+
     try:
-        return float(_get_setting_value(path, default))
+        return float(
+            get_env(
+                key,
+                str(default),
+            )
+        )
+
     except (TypeError, ValueError):
         return default
-
-
-def _get_bool(
-    path: str,
-    default: bool = False,
-) -> bool:
-    value = _get_setting_value(path, default)
-
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on", "enabled"}:
-            return True
-        if normalized in {"0", "false", "no", "off", "disabled"}:
-            return False
-
-    return default
-
-
-def _get_setting_path(key: str) -> Optional[str]:
-    """Resolve a user-facing /set key to its settings.json path."""
-
-    normalized = key.strip().upper()
-    return _CONFIGURABLE_SETTINGS.get(normalized)
 
 
 # ======================================================================
@@ -597,9 +750,22 @@ async def cmd_intraday(
 
     try:
 
-        activated = INTRADAY_ENGINE.activate_daily()
+        activated = INTRADAY_ENGINE.activate()
 
         if activated:
+            first_scan = None
+            try:
+                first_scan = INTRADAY_ENGINE.run_cycle()
+            except Exception:
+                logger.exception(
+                    "Smart Intraday first scan failed after Telegram activation."
+                )
+
+            scan_status = (
+                first_scan.get("status")
+                if isinstance(first_scan, dict)
+                else None
+            )
 
             await update.message.reply_text(
                 (
@@ -607,7 +773,7 @@ async def cmd_intraday(
                     "Mode: DAILY\n"
                     "Expiry: 15:30 IST\n"
                     "Runtime .env: unchanged\n\n"
-                    "A first scan has been triggered."
+                    f"First scan: <b>{escape(str(scan_status or 'TRIGGERED'))}</b>"
                 ),
                 parse_mode="HTML",
             )
@@ -819,6 +985,24 @@ async def cmd_start(
     # /start is the global recovery command.
     MODULE_KILLS.clear()
 
+    if (
+        ALWAYS_ACTIVE_INTRADAY
+        and SMART_CLIENT is not None
+        and getattr(SMART_CLIENT, "is_authenticated", False)
+        and _market_is_open()
+    ):
+        try:
+            if INTRADAY_ENGINE is None:
+                set_intraday_engine_provider(
+                    SMART_CLIENT,
+                    db,
+                )
+            INTRADAY_ENGINE.activate()
+        except Exception:
+            logger.exception(
+                "Failed to immediately reactivate Smart Intraday during /start."
+            )
+
     await update.message.reply_text(
         (
             "🟢 <b>ASTRA resumed.</b>\n\n"
@@ -941,166 +1125,56 @@ async def cmd_suspend(
 # ======================================================================
 
 def _get_admin_password() -> str:
-    """Read the privileged /set password from TELEGRAM_PASSWORD in .env."""
+    """
+    Read the privileged /set password from TELEGRAM_PASSWORD.
 
-    return get_env("TELEGRAM_PASSWORD", "")
+    The password is read-only runtime configuration. It is never
+    modified by Telegram commands.
+    """
 
-
-# Public aliases are intentionally stable for Telegram users, while the
-# underlying storage uses the exact nested structure of settings.json.
-_CONFIGURABLE_SETTINGS: dict[str, str] = {
-    "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER": "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER",
-    "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER": "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER",
-    "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER": "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER",
-    "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER": "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER",
-    "ASTRA_FUNCTIONS.KILL": "ASTRA_FUNCTIONS.KILL",
-    "NORMAL_TRADING.TICKERS_COUNT": "NORMAL_TRADING.TICKERS_COUNT",
-    "NORMAL_TRADING.MIN_TRADE_ALLOCATION": "NORMAL_TRADING.MIN_TRADE_ALLOCATION",
-    "NORMAL_TRADING.MAX_TRADE_ALLOCATION": "NORMAL_TRADING.MAX_TRADE_ALLOCATION",
-    "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT": "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT",
-    "NORMAL_TRADING.RSI_LOWER_THRESHOLD": "NORMAL_TRADING.RSI_LOWER_THRESHOLD",
-    "NORMAL_TRADING.RSI_UPPER_THRESHOLD": "NORMAL_TRADING.RSI_UPPER_THRESHOLD",
-    "NORMAL_TRADING.ENABLE_TRAILING_STOP": "NORMAL_TRADING.ENABLE_TRAILING_STOP",
-    "NORMAL_TRADING.STOP_LOSS_PCT": "NORMAL_TRADING.STOP_LOSS_PCT",
-    "NORMAL_TRADING.TRAILING_STOP_PCT": "NORMAL_TRADING.TRAILING_STOP_PCT",
-    "INTRADAY.TRADING_ENGINE": "INTRADAY.TRADING_ENGINE",
-    "INTRADAY.LIVE_TRADING": "INTRADAY.LIVE_TRADING",
-    "INTRADAY.TICKERS_COUNT": "INTRADAY.TICKERS_COUNT",
-    "INTRADAY.SCAN_INTERVAL_SECONDS": "INTRADAY.SCAN_INTERVAL_SECONDS",
-    "INTRADAY.RSI_LOWER_THRESHOLD": "INTRADAY.RSI_LOWER_THRESHOLD",
-    "INTRADAY.RSI_UPPER_THRESHOLD": "INTRADAY.RSI_UPPER_THRESHOLD",
-    "INTRADAY.MIN_ALLOCATION": "INTRADAY.MIN_ALLOCATION",
-    "INTRADAY.MAX_ALLOCATION": "INTRADAY.MAX_ALLOCATION",
-    "INTRADAY.MAX_POSITIONS": "INTRADAY.MAX_POSITIONS",
-    "INTRADAY.MAX_DAILY_LOSS": "INTRADAY.MAX_DAILY_LOSS",
-    "INTRADAY.STOP_LOSS_PCT": "INTRADAY.STOP_LOSS_PCT",
-    "INTRADAY.TRAILING_STOP_PCT": "INTRADAY.TRAILING_STOP_PCT",
-    "INTRADAY.FORCE_EXIT_TIME": "INTRADAY.FORCE_EXIT_TIME",
-    "MAILER.TIME": "mailer.TIME",
-}
-
-# Backward-compatible short aliases for the old /set interface.
-_CONFIGURABLE_ALIASES: dict[str, str] = {
-    "ASTRA_CYCLE_BUFFER": "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER",
-    "NOTIFICATION_REPEAT_BUFFER": "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER",
-    "TICKERS_COUNT": "NORMAL_TRADING.TICKERS_COUNT",
-    "MIN_TRADE_ALLOCATION": "NORMAL_TRADING.MIN_TRADE_ALLOCATION",
-    "MAX_TRADE_ALLOCATION": "NORMAL_TRADING.MAX_TRADE_ALLOCATION",
-    "PORTFOLIO_ALLOCATION_PCT": "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT",
-    "RSI_LOWER_THRESHOLD": "NORMAL_TRADING.RSI_LOWER_THRESHOLD",
-    "RSI_UPPER_THRESHOLD": "NORMAL_TRADING.RSI_UPPER_THRESHOLD",
-    "ENABLE_TRAILING_STOP": "NORMAL_TRADING.ENABLE_TRAILING_STOP",
-    "STOP_LOSS_PCT": "NORMAL_TRADING.STOP_LOSS_PCT",
-    "TRAILING_STOP_PCT": "NORMAL_TRADING.TRAILING_STOP_PCT",
-    "INTRADAY_TRADING_ENGINE": "INTRADAY.TRADING_ENGINE",
-    "ASTRA_INTRADAY_LIVE_TRADING": "INTRADAY.LIVE_TRADING",
-    "INTRADAY_TICKERS_COUNT": "INTRADAY.TICKERS_COUNT",
-    "INTRADAY_SCAN_INTERVAL_SECONDS": "INTRADAY.SCAN_INTERVAL_SECONDS",
-    "INTRADAY_RSI_LOWER_THRESHOLD": "INTRADAY.RSI_LOWER_THRESHOLD",
-    "INTRADAY_RSI_UPPER_THRESHOLD": "INTRADAY.RSI_UPPER_THRESHOLD",
-    "INTRADAY_MIN_ALLOCATION": "INTRADAY.MIN_ALLOCATION",
-    "INTRADAY_MAX_ALLOCATION": "INTRADAY.MAX_ALLOCATION",
-    "INTRADAY_MAX_POSITIONS": "INTRADAY.MAX_POSITIONS",
-    "INTRADAY_MAX_DAILY_LOSS": "INTRADAY.MAX_DAILY_LOSS",
-    "INTRADAY_STOP_LOSS_PCT": "INTRADAY.STOP_LOSS_PCT",
-    "INTRADAY_TRAILING_STOP_PCT": "INTRADAY.TRAILING_STOP_PCT",
-    "INTRADAY_FORCE_EXIT_TIME": "INTRADAY.FORCE_EXIT_TIME",
-}
-
-_CONFIG_TYPES: dict[str, type] = {
-    "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER": int,
-    "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER": int,
-    "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER": int,
-    "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER": int,
-    "ASTRA_FUNCTIONS.KILL": bool,
-    "NORMAL_TRADING.TICKERS_COUNT": int,
-    "NORMAL_TRADING.MIN_TRADE_ALLOCATION": int,
-    "NORMAL_TRADING.MAX_TRADE_ALLOCATION": int,
-    "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT": float,
-    "NORMAL_TRADING.RSI_LOWER_THRESHOLD": int,
-    "NORMAL_TRADING.RSI_UPPER_THRESHOLD": int,
-    "NORMAL_TRADING.ENABLE_TRAILING_STOP": bool,
-    "NORMAL_TRADING.STOP_LOSS_PCT": float,
-    "NORMAL_TRADING.TRAILING_STOP_PCT": float,
-    "INTRADAY.TRADING_ENGINE": bool,
-    "INTRADAY.LIVE_TRADING": bool,
-    "INTRADAY.TICKERS_COUNT": int,
-    "INTRADAY.SCAN_INTERVAL_SECONDS": int,
-    "INTRADAY.RSI_LOWER_THRESHOLD": int,
-    "INTRADAY.RSI_UPPER_THRESHOLD": int,
-    "INTRADAY.MIN_ALLOCATION": int,
-    "INTRADAY.MAX_ALLOCATION": int,
-    "INTRADAY.MAX_POSITIONS": int,
-    "INTRADAY.MAX_DAILY_LOSS": float,
-    "INTRADAY.STOP_LOSS_PCT": float,
-    "INTRADAY.TRAILING_STOP_PCT": float,
-    "INTRADAY.FORCE_EXIT_TIME": str,
-    "mailer.TIME": str,
-}
+    return os.getenv(
+        "TELEGRAM_PASSWORD",
+        "",
+    )
 
 
-def _resolve_config_key(key: str) -> Optional[str]:
-    normalized = key.strip().upper()
-    if normalized in _CONFIGURABLE_SETTINGS:
-        return _CONFIGURABLE_SETTINGS[normalized]
-    return _CONFIGURABLE_ALIASES.get(normalized)
-
-
-def _parse_config_value(
-    path: str,
-    raw_value: str,
-) -> Any:
-    """Convert /set text into the type expected by settings.json."""
-
-    expected_type = _CONFIG_TYPES.get(path)
-    raw = raw_value.strip()
-
-    if not raw:
-        raise ValueError("Value cannot be empty.")
-
-    if expected_type is bool:
-        normalized = raw.lower()
-        if normalized in {"true", "1", "yes", "on", "enabled"}:
-            return True
-        if normalized in {"false", "0", "no", "off", "disabled"}:
-            return False
-        raise ValueError("Expected a boolean value (true/false).")
-
-    if expected_type is int:
-        return int(raw)
-
-    if expected_type is float:
-        return float(raw)
-
-    if expected_type is str:
-        return raw
-
-    # Defensive fallback for future settings.
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
+_CONFIGURABLE_SETTINGS = (
+    "ASTRA_CYCLE_BUFFER",
+    "NOTIFICATION_REPEAT_BUFFER",
+    "TICKERS_COUNT",
+    "MIN_TRADE_ALLOCATION",
+    "MAX_TRADE_ALLOCATION",
+    "PORTFOLIO_ALLOCATION_PCT",
+    "RSI_LOWER_THRESHOLD",
+    "RSI_UPPER_THRESHOLD",
+    "ENABLE_TRAILING_STOP",
+    "STOP_LOSS_PCT",
+    "TRAILING_STOP_PCT",
+    "INTRADAY_TRADING_ENGINE",
+    "ASTRA_INTRADAY_LIVE_TRADING",
+    "INTRADAY_TICKERS_COUNT",
+    "INTRADAY_SCAN_INTERVAL_SECONDS",
+    "INTRADAY_RSI_LOWER_THRESHOLD",
+    "INTRADAY_RSI_UPPER_THRESHOLD",
+    "INTRADAY_MIN_ALLOCATION",
+    "INTRADAY_MAX_ALLOCATION",
+    "INTRADAY_MAX_POSITIONS",
+    "INTRADAY_MAX_DAILY_LOSS",
+    "INTRADAY_STOP_LOSS_PCT",
+    "INTRADAY_TRAILING_STOP_PCT",
+    "INTRADAY_FORCE_EXIT_TIME",
+    "ASTRA_OFFMARKET_CYCLE_MINUTES",
+    "ASTRA_OFFMARKET_WALLET_REFRESH_MINUTES",
+)
 
 
 def _set_value_is_valid(
     key: str,
     value: str,
 ) -> bool:
-    """Return whether a setting is permitted and has a non-empty value."""
+    """Return whether a setting is safe to expose through /set and /config."""
 
-    return _resolve_config_key(key) is not None and bool(value.strip())
-
-
-def _format_config_value(value: Any) -> str:
-    """Format a setting value safely for Telegram HTML output."""
-
-    if isinstance(value, bool):
-        return "true" if value else "false"
-
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-    return str(value)
+    return key in _CONFIGURABLE_SETTINGS and bool(value)
 
 
 async def cmd_set(
@@ -1118,6 +1192,7 @@ async def cmd_set(
     )
 
     if len(args) < 3:
+
         await update.message.reply_text(
             (
                 "❌ Invalid syntax.\n\n"
@@ -1125,11 +1200,14 @@ async def cmd_set(
             ),
             parse_mode="HTML",
         )
+
         return
 
     password = args[0]
-    key = args[1].strip()
-    value = " ".join(args[2:]).strip()
+    key = args[1].strip().upper()
+    value = " ".join(
+        args[2:]
+    ).strip()
 
     configured_password = _get_admin_password()
 
@@ -1141,42 +1219,46 @@ async def cmd_set(
             configured_password,
         )
     ):
-        logger.warning("Rejected unauthenticated /set request.")
-        await update.message.reply_text("❌ Authentication failed.")
+
+        # Never log, echo or otherwise expose the supplied password.
+        logger.warning(
+            "Rejected unauthenticated /set request."
+        )
+
+        await update.message.reply_text(
+            "❌ Authentication failed."
+        )
+
         return
 
-    path = _resolve_config_key(key)
+    if not _set_value_is_valid(
+        key,
+        value,
+    ):
 
-    if path is None or not _set_value_is_valid(key, value):
         await update.message.reply_text(
             (
                 "❌ Unsupported runtime setting.\n\n"
-                "Use /config to see the settings exposed through /set."
+                "The requested setting is not permitted "
+                "through /set."
             )
         )
+
         return
 
-    try:
-        parsed_value = _parse_config_value(path, value)
-        update_setting(path, parsed_value, persist=True)
-    except (ValueError, TypeError, SettingsError) as exc:
-        logger.warning("Rejected /set for %s: %s", path, exc)
-        await update.message.reply_text(
-            f"❌ Invalid value for <code>{escape(path)}</code>: "
-            f"{escape(str(exc))}",
-            parse_mode="HTML",
-        )
-        return
+    RUNTIME_CONFIG[key] = value
 
-    logger.info("Runtime configuration updated: %s", path)
+    logger.info(
+        "Runtime configuration updated: %s",
+        key,
+    )
 
     await update.message.reply_text(
         (
             "🟢 <b>Runtime configuration updated.</b>\n\n"
-            f"Setting: <code>{escape(path)}</code>\n"
-            f"Value: <code>{escape(_format_config_value(parsed_value))}</code>\n\n"
-            "Saved to <code>settings.json</code>.\n"
-            "The <code>.env</code> file was not modified."
+            f"Setting: <code>{escape(key)}</code>\n"
+            f"Value: <code>{escape(value)}</code>\n\n"
+            "The .env file was not modified."
         ),
         parse_mode="HTML",
     )
@@ -1211,6 +1293,13 @@ def _market_is_open() -> bool:
 
 
 def _get_intraday_status() -> tuple[str, str]:
+    """Return Smart Intraday status from the shared in-memory engine.
+
+    The old implementation queried the database with the wrong signature and
+    could therefore report OFF even immediately after /intraday activated the
+    engine. The shared singleton is now authoritative for live process state;
+    the DB is used only as a recovery/telemetry fallback.
+    """
 
     if is_module_killed("intraday"):
         return (
@@ -1218,36 +1307,60 @@ def _get_intraday_status() -> tuple[str, str]:
             "Module killed.",
         )
 
-    active_session = None
+    if INTRADAY_ENGINE is not None:
+        try:
+            status_method = getattr(
+                INTRADAY_ENGINE,
+                "status",
+                None,
+            )
+            if callable(status_method):
+                snapshot = status_method()
+                if isinstance(snapshot, dict):
+                    active = bool(snapshot.get("active", False))
+                    session_date = snapshot.get("session_date")
+                    execution_mode = snapshot.get(
+                        "execution_mode",
+                        "ADVISORY",
+                    )
 
+                    if active:
+                        details = (
+                            f"Mode: DAILY\n"
+                            f"Date: {escape(str(session_date or 'unknown'))}\n"
+                            f"Open positions: {int(snapshot.get('open_positions', 0) or 0)}\n"
+                            f"Mode: {escape(str(execution_mode))}"
+                        )
+                        return ("🟢 ON", details)
+        except Exception:
+            logger.debug(
+                "Unable to read shared Smart Intraday status.",
+                exc_info=True,
+            )
+
+    # Recovery fallback for a process where the provider has not yet been
+    # registered. DatabaseManager requires an explicit session date.
     try:
-        active_session = (
-            db.get_active_intraday_session()
-        )
+        session_date = _now_ist().date().isoformat()
+        active_session = db.get_active_intraday_session(session_date)
+        if active_session:
+            mode = getattr(active_session, "mode", "DAILY")
+            stored_date = getattr(
+                active_session,
+                "session_date",
+                session_date,
+            )
+            return (
+                "🟢 ON",
+                (
+                    f"Mode: {escape(str(mode))}\n"
+                    f"Date: {escape(str(stored_date))}"
+                ),
+            )
     except Exception:
         logger.debug(
-            "Unable to read active intraday session.",
+            "Unable to read persisted Smart Intraday session.",
             exc_info=True,
-        )
-
-    if active_session:
-
-        mode = active_session.get(
-            "mode",
-            "DAILY",
-        )
-
-        session_date = active_session.get(
-            "session_date",
-            "unknown",
-        )
-
-        return (
-            "🟢 ON",
-            (
-                f"Mode: {escape(str(mode))}\n"
-                f"Date: {escape(str(session_date))}"
-            ),
         )
 
     return (
@@ -1381,12 +1494,15 @@ async def cmd_status(
             "\n<b>Smart Intraday</b>\n"
             f"Status: {intraday_status}\n"
             f"{intraday_details}\n"
+            f"Always-active override: {'ON' if ALWAYS_ACTIVE_INTRADAY else 'OFF'}\n"
 
             "\n<b>SIP</b>\n"
             f"Status: {sip_status_text}\n"
             f"Targets: {target_count} | "
             f"Active: {active_target_count} | "
-            f"Paused: {paused_target_count}"
+            f"Paused: {paused_target_count}\n"
+            f"Always-active override: {'ON' if ALWAYS_ACTIVE_SIP else 'OFF'}\n"
+            f"IPO always-active override: {'ON' if ALWAYS_ACTIVE_IPO else 'OFF'}"
         ),
         parse_mode="HTML",
     )
@@ -1495,46 +1611,27 @@ async def cmd_config(
     update,
     context,
 ):
-    """Show the persistent runtime settings exposed through /set."""
-
-    try:
-        settings = get_settings()
-    except SettingsError as exc:
-        logger.exception("Unable to load settings for /config")
-        await update.message.reply_text(
-            f"❌ Unable to load settings.json: {escape(str(exc))}",
-            parse_mode="HTML",
-        )
-        return
+    """Show only settings that are explicitly configurable through /set."""
 
     lines = [
-        "<b>ASTRA Runtime Configuration</b>",
+        "<b>ASTRA Configurable Settings</b>",
         "",
     ]
 
-    for section_name, section in settings.items():
-        if not isinstance(section, dict):
-            lines.append(
-                f"<b>{escape(str(section_name))}</b>: "
-                f"<code>{escape(_format_config_value(section))}</code>"
-            )
-            continue
-
-        lines.append(f"<b>[{escape(str(section_name))}]</b>")
-
-        for key, value in section.items():
-            lines.append(
-                f"  <b>{escape(str(key))}</b>: "
-                f"<code>{escape(_format_config_value(value))}</code>"
-            )
-
-        lines.append("")
+    for key in _CONFIGURABLE_SETTINGS:
+        value = get_env(key, "")
+        if key == "INTRADAY_FORCE_EXIT_TIME":
+            value = value or "15:30"
+        lines.append(
+            f"<b>{escape(key)}</b>: "
+            f"<code>{escape(str(value))}</code>"
+        )
 
     lines.extend(
         [
-            "<i>/set requires the TELEGRAM_PASSWORD from .env.</i>",
-            "<i>Changes are persisted to settings.json.</i>",
-            "<i>Critical secrets in .env are never displayed here.</i>",
+            "",
+            "<i>Only non-critical runtime-configurable settings are shown.</i>",
+            "<i>Runtime overrides do not modify .env.</i>",
         ]
     )
 

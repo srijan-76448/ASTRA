@@ -86,13 +86,12 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
-
-from utils import get_setting
 
 
 # ============================================================================
@@ -133,146 +132,6 @@ DEFAULT_DURATION_DAYS = 365
 MIN_SIP_AMOUNT = 1.0
 
 DECISION_HISTORY_LIMIT = 5000
-
-
-# ============================================================================
-# SETTINGS HELPERS
-# ============================================================================
-
-def _setting_int(
-    path: str,
-    default: int,
-) -> int:
-    """
-    Read an integer SIP runtime setting from settings.json.
-    """
-
-    try:
-
-        value = int(
-            get_setting(
-                path,
-                default,
-            )
-        )
-
-        return value
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return default
-
-
-def _setting_float(
-    path: str,
-    default: float,
-) -> float:
-    """
-    Read a float SIP runtime setting from settings.json.
-    """
-
-    try:
-
-        value = float(
-            get_setting(
-                path,
-                default,
-            )
-        )
-
-        return value
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        return default
-
-
-def _setting_str(
-    path: str,
-    default: str,
-) -> str:
-    """
-    Read a string SIP runtime setting from settings.json.
-    """
-
-    try:
-
-        value = get_setting(
-            path,
-            default,
-        )
-
-        if value is None:
-            return default
-
-        value = str(
-            value
-        ).strip()
-
-        return value or default
-
-    except Exception:
-
-        return default
-
-
-def _sip_default_frequency() -> str:
-    """
-    Return the configured default SIP frequency.
-    """
-
-    return _setting_str(
-        "SIP.DEFAULT_FREQUENCY",
-        DEFAULT_FREQUENCY,
-    ).upper()
-
-
-def _sip_default_duration_days() -> int:
-    """
-    Return the configured default SIP duration.
-    """
-
-    return max(
-        1,
-        _setting_int(
-            "SIP.DEFAULT_DURATION_DAYS",
-            DEFAULT_DURATION_DAYS,
-        ),
-    )
-
-
-def _sip_min_amount() -> float:
-    """
-    Return the configured minimum SIP contribution amount.
-    """
-
-    return max(
-        0.01,
-        _setting_float(
-            "SIP.MIN_SIP_AMOUNT",
-            MIN_SIP_AMOUNT,
-        ),
-    )
-
-
-def _sip_decision_history_limit() -> int:
-    """
-    Return the configured in-memory SIP decision-history limit.
-    """
-
-    return max(
-        1,
-        _setting_int(
-            "SIP.DECISION_HISTORY_LIMIT",
-            DECISION_HISTORY_LIMIT,
-        ),
-    )
 
 
 # ============================================================================
@@ -387,9 +246,7 @@ class SIPTarget:
     status: SIPTargetStatus = SIPTargetStatus.ACTIVE
 
     created_at: dt.datetime = field(
-        default_factory=lambda: dt.datetime.now(
-            IST
-        )
+        default_factory=lambda: dt.datetime.now(IST)
     )
 
     next_execution_at: Optional[dt.datetime] = None
@@ -410,17 +267,9 @@ class SIPTarget:
         Return True when the target has reached its expiry time.
         """
 
-        current_time = (
-            now
-            or dt.datetime.now(
-                IST
-            )
-        )
+        current_time = now or dt.datetime.now(IST)
 
-        return (
-            current_time
-            >= self.expires_at
-        )
+        return current_time >= self.expires_at
 
     def refresh_status(
         self,
@@ -436,14 +285,10 @@ class SIPTarget:
         """
 
         if (
-            self.status
-            == SIPTargetStatus.ACTIVE
+            self.status == SIPTargetStatus.ACTIVE
             and self.is_expired(now)
         ):
-
-            self.status = (
-                SIPTargetStatus.EXPIRED
-            )
+            self.status = SIPTargetStatus.EXPIRED
 
         return self.status
 
@@ -452,14 +297,9 @@ class SIPTarget:
         Return whether the target is currently operational.
         """
 
-        return (
-            self.status
-            == SIPTargetStatus.ACTIVE
-        )
+        return self.status == SIPTargetStatus.ACTIVE
 
-    def to_dict(
-        self,
-    ) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """
         Serialize the SIP target into a dictionary.
         """
@@ -469,30 +309,18 @@ class SIPTarget:
             "asset": self.asset,
             "amount": self.amount,
             "frequency": self.frequency,
-            "start_at": (
-                self.start_at.isoformat()
-            ),
-            "expires_at": (
-                self.expires_at.isoformat()
-            ),
+            "start_at": self.start_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
             "status": self.status.value,
-            "created_at": (
-                self.created_at.isoformat()
-            ),
+            "created_at": self.created_at.isoformat(),
             "next_execution_at": (
                 self.next_execution_at.isoformat()
                 if self.next_execution_at is not None
                 else None
             ),
-            "completed_contributions": (
-                self.completed_contributions
-            ),
-            "total_invested": (
-                self.total_invested
-            ),
-            "metadata": copy.deepcopy(
-                self.metadata
-            ),
+            "completed_contributions": self.completed_contributions,
+            "total_invested": self.total_invested,
+            "metadata": copy.deepcopy(self.metadata),
         }
 
 
@@ -577,9 +405,7 @@ class SIPDecision:
         default_factory=dict
     )
 
-    def to_dict(
-        self,
-    ) -> Dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         """
         Serialize the decision into a dictionary suitable for:
 
@@ -590,9 +416,7 @@ class SIPDecision:
         """
 
         return {
-            "timestamp": (
-                self.timestamp.isoformat()
-            ),
+            "timestamp": self.timestamp.isoformat(),
             "target_id": self.target_id,
             "asset": self.asset,
             "decision": self.decision,
@@ -600,9 +424,7 @@ class SIPDecision:
             "rsi": self.rsi,
             "macd": self.macd,
             "trend": self.trend,
-            "market_condition": (
-                self.market_condition
-            ),
+            "market_condition": self.market_condition,
             "allocation": self.allocation,
             "reason": self.reason,
             "technical_signals": copy.deepcopy(
@@ -619,6 +441,25 @@ class SIPDecision:
                 self.metadata
             ),
         }
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    """Read a boolean environment override safely."""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+ALWAYS_ACTIVE_SIP = _env_bool(
+    "ALWAYS_ACTIVE_SIP",
+    False,
+)
 
 
 # ============================================================================
@@ -646,36 +487,31 @@ class SIPEngine:
 
     def __init__(
         self,
-        decision_history_limit: Optional[int] = None,
+        decision_history_limit: int = DECISION_HISTORY_LIMIT,
     ) -> None:
 
         self._lock = threading.RLock()
 
-        self._active = False
+        self._active = ALWAYS_ACTIVE_SIP
 
-        self._activated_at: Optional[
-            dt.datetime
-        ] = None
+        self._activated_at: Optional[dt.datetime] = (
+            dt.datetime.now(IST)
+            if ALWAYS_ACTIVE_SIP
+            else None
+        )
 
-        self._targets: Dict[
-            str,
-            SIPTarget,
-        ] = {}
-
-        self._decisions: List[
-            SIPDecision
-        ] = []
-
-        if decision_history_limit is None:
-            decision_history_limit = (
-                _sip_decision_history_limit()
+        if ALWAYS_ACTIVE_SIP:
+            logger.info(
+                "ALWAYS_ACTIVE_SIP override enabled; SIP engine initialized active."
             )
+
+        self._targets: Dict[str, SIPTarget] = {}
+
+        self._decisions: List[SIPDecision] = []
 
         self._decision_history_limit = max(
             1,
-            int(
-                decision_history_limit
-            ),
+            int(decision_history_limit),
         )
 
     # ------------------------------------------------------------------
@@ -683,9 +519,7 @@ class SIPEngine:
     # ------------------------------------------------------------------
 
     @property
-    def active(
-        self,
-    ) -> bool:
+    def active(self) -> bool:
         """
         Return whether the SIP engine is currently active.
         """
@@ -694,9 +528,7 @@ class SIPEngine:
             return self._active
 
     @property
-    def activated_at(
-        self,
-    ) -> Optional[dt.datetime]:
+    def activated_at(self) -> Optional[dt.datetime]:
         """
         Return the time at which the SIP engine was activated.
         """
@@ -708,9 +540,7 @@ class SIPEngine:
     # ENGINE LIFECYCLE
     # ------------------------------------------------------------------
 
-    def activate(
-        self,
-    ) -> bool:
+    def activate(self) -> bool:
         """
         Activate the SIP subsystem.
 
@@ -720,7 +550,6 @@ class SIPEngine:
         with self._lock:
 
             if self._active:
-
                 logger.info(
                     "SIP engine is already active."
                 )
@@ -729,10 +558,8 @@ class SIPEngine:
 
             self._active = True
 
-            self._activated_at = (
-                dt.datetime.now(
-                    IST
-                )
+            self._activated_at = dt.datetime.now(
+                IST
             )
 
             logger.info(
@@ -763,7 +590,6 @@ class SIPEngine:
         with self._lock:
 
             if not self._active:
-
                 logger.info(
                     "SIP engine is already inactive. reason=%s",
                     reason,
@@ -796,15 +622,9 @@ class SIPEngine:
 
         date_part = dt.datetime.now(
             IST
-        ).strftime(
-            "%Y%m%d"
-        )
+        ).strftime("%Y%m%d")
 
-        random_part = (
-            uuid.uuid4()
-            .hex[:6]
-            .upper()
-        )
+        random_part = uuid.uuid4().hex[:6].upper()
 
         return (
             f"SIP-{date_part}-{random_part}"
@@ -823,11 +643,7 @@ class SIPEngine:
         """
 
         try:
-
-            normalized = float(
-                amount
-            )
-
+            normalized = float(amount)
         except (
             TypeError,
             ValueError,
@@ -837,15 +653,10 @@ class SIPEngine:
                 "SIP amount must be numeric."
             ) from exc
 
-        minimum_amount = (
-            _sip_min_amount()
-        )
-
-        if normalized < minimum_amount:
-
+        if normalized < MIN_SIP_AMOUNT:
             raise SIPValidationError(
                 f"SIP amount must be at least "
-                f"{minimum_amount:.2f}."
+                f"{MIN_SIP_AMOUNT:.2f}."
             )
 
         return normalized
@@ -862,23 +673,15 @@ class SIPEngine:
             frequency,
             str,
         ):
-
             raise SIPValidationError(
                 "SIP frequency must be a string."
             )
 
-        normalized = (
-            frequency
-            .strip()
-            .upper()
-        )
+        normalized = frequency.strip().upper()
 
         if normalized not in VALID_FREQUENCIES:
-
             valid = ", ".join(
-                sorted(
-                    VALID_FREQUENCIES
-                )
+                sorted(VALID_FREQUENCIES)
             )
 
             raise SIPValidationError(
@@ -901,7 +704,6 @@ class SIPEngine:
             start_at,
             dt.datetime,
         ):
-
             raise SIPValidationError(
                 "start_at must be a datetime."
             )
@@ -910,25 +712,21 @@ class SIPEngine:
             expires_at,
             dt.datetime,
         ):
-
             raise SIPValidationError(
                 "expires_at must be a datetime."
             )
 
         if start_at.tzinfo is None:
-
             raise SIPValidationError(
                 "start_at must be timezone-aware."
             )
 
         if expires_at.tzinfo is None:
-
             raise SIPValidationError(
                 "expires_at must be timezone-aware."
             )
 
         if expires_at <= start_at:
-
             raise SIPValidationError(
                 "SIP expiry must be after the start time."
             )
@@ -945,19 +743,13 @@ class SIPEngine:
             asset,
             str,
         ):
-
             raise SIPValidationError(
                 "SIP asset must be a string."
             )
 
-        normalized = (
-            asset
-            .strip()
-            .upper()
-        )
+        normalized = asset.strip().upper()
 
         if not normalized:
-
             raise SIPValidationError(
                 "SIP asset cannot be empty."
             )
@@ -972,12 +764,10 @@ class SIPEngine:
         self,
         asset: str,
         amount: float,
-        frequency: Optional[str] = None,
-        duration_days: Optional[int] = None,
+        frequency: str = DEFAULT_FREQUENCY,
+        duration_days: int = DEFAULT_DURATION_DAYS,
         start_at: Optional[dt.datetime] = None,
-        metadata: Optional[
-            Dict[str, Any]
-        ] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SIPTarget:
         """
         Create a new SIP target.
@@ -994,11 +784,9 @@ class SIPEngine:
 
         frequency:
             WEEKLY, BIWEEKLY, MONTHLY, QUARTERLY or YEARLY.
-            When omitted, SIP.DEFAULT_FREQUENCY is used.
 
         duration_days:
             Number of days until target expiry.
-            When omitted, SIP.DEFAULT_DURATION_DAYS is used.
 
         start_at:
             Optional timezone-aware start timestamp.
@@ -1009,34 +797,19 @@ class SIPEngine:
 
         with self._lock:
 
-            if frequency is None:
-                frequency = (
-                    _sip_default_frequency()
-                )
-
-            if duration_days is None:
-                duration_days = (
-                    _sip_default_duration_days()
-                )
-
             if not self._active:
-
                 raise SIPNotActiveError(
                     "SIP engine is not active. "
                     "Activate SIP using /SIP before "
                     "creating a target."
                 )
 
-            normalized_asset = (
-                self._normalize_asset(
-                    asset
-                )
+            normalized_asset = self._normalize_asset(
+                asset
             )
 
-            normalized_amount = (
-                self._validate_amount(
-                    amount
-                )
+            normalized_amount = self._validate_amount(
+                amount
             )
 
             normalized_frequency = (
@@ -1046,11 +819,9 @@ class SIPEngine:
             )
 
             try:
-
                 normalized_duration = int(
                     duration_days
                 )
-
             except (
                 TypeError,
                 ValueError,
@@ -1061,25 +832,18 @@ class SIPEngine:
                 ) from exc
 
             if normalized_duration <= 0:
-
                 raise SIPValidationError(
                     "duration_days must be greater than zero."
                 )
 
             if start_at is None:
-
-                normalized_start = (
-                    dt.datetime.now(
-                        IST
-                    )
+                normalized_start = dt.datetime.now(
+                    IST
                 )
-
             else:
-
                 normalized_start = start_at
 
             if normalized_start.tzinfo is None:
-
                 raise SIPValidationError(
                     "start_at must be timezone-aware."
                 )
@@ -1096,9 +860,7 @@ class SIPEngine:
                 expires_at,
             )
 
-            target_id = (
-                self._generate_target_id()
-            )
+            target_id = self._generate_target_id()
 
             target = SIPTarget(
                 target_id=target_id,
@@ -1114,9 +876,7 @@ class SIPEngine:
                 ),
             )
 
-            self._targets[
-                target_id
-            ] = target
+            self._targets[target_id] = target
 
             logger.info(
                 "SIP target created | id=%s | asset=%s | "
@@ -1130,9 +890,7 @@ class SIPEngine:
                 target.expires_at.isoformat(),
             )
 
-            return copy.deepcopy(
-                target
-            )
+            return copy.deepcopy(target)
 
     # ------------------------------------------------------------------
     # TARGET LOOKUP
@@ -1155,16 +913,13 @@ class SIPEngine:
             )
 
             if target is None:
-
                 raise SIPTargetNotFoundError(
                     f"SIP target '{target_id}' was not found."
                 )
 
             target.refresh_status()
 
-            return copy.deepcopy(
-                target
-            )
+            return copy.deepcopy(target)
 
     def get_targets(
         self,
@@ -1182,7 +937,6 @@ class SIPEngine:
         with self._lock:
 
             for target in self._targets.values():
-
                 target.refresh_status()
 
             targets = list(
@@ -1190,7 +944,6 @@ class SIPEngine:
             )
 
             if not include_expired:
-
                 targets = [
                     target
                     for target in targets
@@ -1207,9 +960,7 @@ class SIPEngine:
             )
 
             return [
-                copy.deepcopy(
-                    target
-                )
+                copy.deepcopy(target)
                 for target in targets
             ]
 
@@ -1227,37 +978,27 @@ class SIPEngine:
 
         with self._lock:
 
-            target = (
-                self._get_mutable_target(
-                    target_id
-                )
+            target = self._get_mutable_target(
+                target_id
             )
 
             target.refresh_status()
 
-            if (
-                target.status
-                != SIPTargetStatus.ACTIVE
-            ):
-
+            if target.status != SIPTargetStatus.ACTIVE:
                 raise SIPTargetStateError(
                     f"Cannot pause SIP target "
                     f"'{target_id}' from state "
                     f"'{target.status.value}'."
                 )
 
-            target.status = (
-                SIPTargetStatus.PAUSED
-            )
+            target.status = SIPTargetStatus.PAUSED
 
             logger.info(
                 "SIP target paused | id=%s",
                 target_id,
             )
 
-            return copy.deepcopy(
-                target
-            )
+            return copy.deepcopy(target)
 
     def resume_target(
         self,
@@ -1271,47 +1012,33 @@ class SIPEngine:
 
         with self._lock:
 
-            target = (
-                self._get_mutable_target(
-                    target_id
-                )
+            target = self._get_mutable_target(
+                target_id
             )
 
             target.refresh_status()
 
-            if (
-                target.status
-                == SIPTargetStatus.EXPIRED
-            ):
-
+            if target.status == SIPTargetStatus.EXPIRED:
                 raise SIPTargetStateError(
                     f"SIP target '{target_id}' has expired "
                     "and cannot be resumed."
                 )
 
-            if (
-                target.status
-                != SIPTargetStatus.PAUSED
-            ):
-
+            if target.status != SIPTargetStatus.PAUSED:
                 raise SIPTargetStateError(
                     f"Cannot resume SIP target "
                     f"'{target_id}' from state "
                     f"'{target.status.value}'."
                 )
 
-            target.status = (
-                SIPTargetStatus.ACTIVE
-            )
+            target.status = SIPTargetStatus.ACTIVE
 
             logger.info(
                 "SIP target resumed | id=%s",
                 target_id,
             )
 
-            return copy.deepcopy(
-                target
-            )
+            return copy.deepcopy(target)
 
     def cancel_target(
         self,
@@ -1325,10 +1052,8 @@ class SIPEngine:
 
         with self._lock:
 
-            target = (
-                self._get_mutable_target(
-                    target_id
-                )
+            target = self._get_mutable_target(
+                target_id
             )
 
             target.refresh_status()
@@ -1338,25 +1063,20 @@ class SIPEngine:
                 SIPTargetStatus.COMPLETED,
                 SIPTargetStatus.EXPIRED,
             }:
-
                 raise SIPTargetStateError(
                     f"Cannot cancel SIP target "
                     f"'{target_id}' from terminal state "
                     f"'{target.status.value}'."
                 )
 
-            target.status = (
-                SIPTargetStatus.CANCELLED
-            )
+            target.status = SIPTargetStatus.CANCELLED
 
             logger.info(
                 "SIP target cancelled | id=%s",
                 target_id,
             )
 
-            return copy.deepcopy(
-                target
-            )
+            return copy.deepcopy(target)
 
     def complete_target(
         self,
@@ -1371,10 +1091,8 @@ class SIPEngine:
 
         with self._lock:
 
-            target = (
-                self._get_mutable_target(
-                    target_id
-                )
+            target = self._get_mutable_target(
+                target_id
             )
 
             target.refresh_status()
@@ -1383,25 +1101,20 @@ class SIPEngine:
                 SIPTargetStatus.ACTIVE,
                 SIPTargetStatus.PAUSED,
             }:
-
                 raise SIPTargetStateError(
                     f"Cannot complete SIP target "
                     f"'{target_id}' from state "
                     f"'{target.status.value}'."
                 )
 
-            target.status = (
-                SIPTargetStatus.COMPLETED
-            )
+            target.status = SIPTargetStatus.COMPLETED
 
             logger.info(
                 "SIP target completed | id=%s",
                 target_id,
             )
 
-            return copy.deepcopy(
-                target
-            )
+            return copy.deepcopy(target)
 
     # ------------------------------------------------------------------
     # TARGET INTERNAL LOOKUP
@@ -1422,7 +1135,6 @@ class SIPEngine:
         )
 
         if target is None:
-
             raise SIPTargetNotFoundError(
                 f"SIP target '{target_id}' was not found."
             )
@@ -1437,18 +1149,10 @@ class SIPEngine:
         self,
         target_id: str,
         amount: float,
-        execution_time: Optional[
-            dt.datetime
-        ] = None,
-        execution_price: Optional[
-            float
-        ] = None,
-        quantity: Optional[
-            float
-        ] = None,
-        broker_order_id: Optional[
-            str
-        ] = None,
+        execution_time: Optional[dt.datetime] = None,
+        execution_price: Optional[float] = None,
+        quantity: Optional[float] = None,
+        broker_order_id: Optional[str] = None,
     ) -> SIPTarget:
         """
         Register a completed SIP contribution.
@@ -1463,41 +1167,29 @@ class SIPEngine:
 
         with self._lock:
 
-            target = (
-                self._get_mutable_target(
-                    target_id
-                )
+            target = self._get_mutable_target(
+                target_id
             )
 
             target.refresh_status()
 
-            if (
-                target.status
-                != SIPTargetStatus.ACTIVE
-            ):
-
+            if target.status != SIPTargetStatus.ACTIVE:
                 raise SIPTargetStateError(
                     f"Cannot register a contribution for "
                     f"SIP target '{target_id}' because its "
                     f"state is '{target.status.value}'."
                 )
 
-            normalized_amount = (
-                self._validate_amount(
-                    amount
-                )
+            normalized_amount = self._validate_amount(
+                amount
             )
 
             if execution_time is None:
-
-                execution_time = (
-                    dt.datetime.now(
-                        IST
-                    )
+                execution_time = dt.datetime.now(
+                    IST
                 )
 
             if execution_time.tzinfo is None:
-
                 raise SIPValidationError(
                     "execution_time must be timezone-aware."
                 )
@@ -1511,17 +1203,11 @@ class SIPEngine:
             target.metadata[
                 "last_contribution"
             ] = {
-                "timestamp": (
-                    execution_time.isoformat()
-                ),
+                "timestamp": execution_time.isoformat(),
                 "amount": normalized_amount,
-                "execution_price": (
-                    execution_price
-                ),
+                "execution_price": execution_price,
                 "quantity": quantity,
-                "broker_order_id": (
-                    broker_order_id
-                ),
+                "broker_order_id": broker_order_id,
             }
 
             logger.info(
@@ -1534,9 +1220,7 @@ class SIPEngine:
                 target.total_invested,
             )
 
-            return copy.deepcopy(
-                target
-            )
+            return copy.deepcopy(target)
 
     # ------------------------------------------------------------------
     # DECISION TELEMETRY
@@ -1555,24 +1239,12 @@ class SIPEngine:
         trend: Optional[str] = None,
         market_condition: Optional[str] = None,
         allocation: Optional[float] = None,
-        technical_signals: Optional[
-            Dict[str, Any]
-        ] = None,
-        market_context: Optional[
-            Dict[str, Any]
-        ] = None,
-        risk_checks: Optional[
-            Dict[str, Any]
-        ] = None,
-        risk_passed: Optional[
-            bool
-        ] = None,
-        metadata: Optional[
-            Dict[str, Any]
-        ] = None,
-        timestamp: Optional[
-            dt.datetime
-        ] = None,
+        technical_signals: Optional[Dict[str, Any]] = None,
+        market_context: Optional[Dict[str, Any]] = None,
+        risk_checks: Optional[Dict[str, Any]] = None,
+        risk_passed: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[dt.datetime] = None,
     ) -> SIPDecision:
         """
         Record a SIP decision.
@@ -1601,43 +1273,33 @@ class SIPEngine:
 
         with self._lock:
 
-            target = (
-                self._get_mutable_target(
-                    target_id
-                )
+            target = self._get_mutable_target(
+                target_id
             )
 
             if not isinstance(
                 decision,
                 str,
             ):
-
                 raise SIPValidationError(
                     "decision must be a string."
                 )
 
             normalized_decision = (
-                decision
-                .strip()
-                .upper()
+                decision.strip().upper()
             )
 
             if not normalized_decision:
-
                 raise SIPValidationError(
                     "decision cannot be empty."
                 )
 
             if timestamp is None:
-
-                timestamp = (
-                    dt.datetime.now(
-                        IST
-                    )
+                timestamp = dt.datetime.now(
+                    IST
                 )
 
             if timestamp.tzinfo is None:
-
                 raise SIPValidationError(
                     "timestamp must be timezone-aware."
                 )
@@ -1648,76 +1310,52 @@ class SIPEngine:
                 else target.asset
             )
 
-            resolved_asset = (
-                self._normalize_asset(
-                    resolved_asset
-                )
+            resolved_asset = self._normalize_asset(
+                resolved_asset
             )
 
             if price is not None:
-
                 try:
-
-                    price = float(
-                        price
-                    )
-
+                    price = float(price)
                 except (
                     TypeError,
                     ValueError,
                 ) as exc:
-
                     raise SIPValidationError(
                         "price must be numeric."
                     ) from exc
 
             if rsi is not None:
-
                 try:
-
-                    rsi = float(
-                        rsi
-                    )
-
+                    rsi = float(rsi)
                 except (
                     TypeError,
                     ValueError,
                 ) as exc:
-
                     raise SIPValidationError(
                         "rsi must be numeric."
                     ) from exc
 
             if macd is not None:
-
                 try:
-
-                    macd = float(
-                        macd
-                    )
-
+                    macd = float(macd)
                 except (
                     TypeError,
                     ValueError,
                 ) as exc:
-
                     raise SIPValidationError(
                         "macd must be numeric."
                     ) from exc
 
             if allocation is not None:
-
                 try:
-
                     allocation = float(
                         allocation
                     )
-
                 except (
                     TypeError,
                     ValueError,
                 ) as exc:
-
                     raise SIPValidationError(
                         "allocation must be numeric."
                     ) from exc
@@ -1726,10 +1364,7 @@ class SIPEngine:
                 reason,
                 str,
             ):
-
-                reason = str(
-                    reason
-                )
+                reason = str(reason)
 
             decision_record = SIPDecision(
                 timestamp=timestamp,
@@ -1740,9 +1375,7 @@ class SIPEngine:
                 rsi=rsi,
                 macd=macd,
                 trend=trend,
-                market_condition=(
-                    market_condition
-                ),
+                market_condition=market_condition,
                 allocation=allocation,
                 reason=reason.strip(),
                 technical_signals=copy.deepcopy(
@@ -1768,7 +1401,6 @@ class SIPEngine:
                 len(self._decisions)
                 > self._decision_history_limit
             ):
-
                 overflow = (
                     len(self._decisions)
                     - self._decision_history_limit
@@ -1821,11 +1453,9 @@ class SIPEngine:
             if limit is not None:
 
                 try:
-
                     normalized_limit = int(
                         limit
                     )
-
                 except (
                     TypeError,
                     ValueError,
@@ -1843,9 +1473,7 @@ class SIPEngine:
                 ]
 
             return [
-                copy.deepcopy(
-                    decision
-                )
+                copy.deepcopy(decision)
                 for decision in decisions
             ]
 
@@ -1863,11 +1491,7 @@ class SIPEngine:
                 self._decisions
             ):
 
-                if (
-                    decision.target_id
-                    == target_id
-                ):
-
+                if decision.target_id == target_id:
                     return copy.deepcopy(
                         decision
                     )
@@ -1878,9 +1502,7 @@ class SIPEngine:
     # REFRESH
     # ------------------------------------------------------------------
 
-    def refresh(
-        self,
-    ) -> List[SIPTarget]:
+    def refresh(self) -> List[SIPTarget]:
         """
         Refresh target lifecycle states.
 
@@ -1895,9 +1517,7 @@ class SIPEngine:
 
             for target in self._targets.values():
 
-                previous_status = (
-                    target.status
-                )
+                previous_status = target.status
 
                 target.refresh_status(
                     now
@@ -1907,7 +1527,6 @@ class SIPEngine:
                     previous_status
                     != target.status
                 ):
-
                     logger.info(
                         "SIP target status changed | "
                         "id=%s | %s -> %s",
@@ -1917,9 +1536,7 @@ class SIPEngine:
                     )
 
             return [
-                copy.deepcopy(
-                    target
-                )
+                copy.deepcopy(target)
                 for target in self._targets.values()
             ]
 
@@ -1927,9 +1544,7 @@ class SIPEngine:
     # STATUS
     # ------------------------------------------------------------------
 
-    def status(
-        self,
-    ) -> Dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         """
         Return a complete SIP subsystem status snapshot.
         """
@@ -1939,23 +1554,14 @@ class SIPEngine:
             self.refresh()
 
             active_count = 0
-
             paused_count = 0
 
             for target in self._targets.values():
 
-                if (
-                    target.status
-                    == SIPTargetStatus.ACTIVE
-                ):
-
+                if target.status == SIPTargetStatus.ACTIVE:
                     active_count += 1
 
-                elif (
-                    target.status
-                    == SIPTargetStatus.PAUSED
-                ):
-
+                elif target.status == SIPTargetStatus.PAUSED:
                     paused_count += 1
 
             return {
@@ -1968,12 +1574,8 @@ class SIPEngine:
                 "target_count": len(
                     self._targets
                 ),
-                "active_target_count": (
-                    active_count
-                ),
-                "paused_target_count": (
-                    paused_count
-                ),
+                "active_target_count": active_count,
+                "paused_target_count": paused_count,
                 "decision_count": len(
                     self._decisions
                 ),
@@ -1985,48 +1587,10 @@ class SIPEngine:
 
 
 # ============================================================================
-# MODULE DIAGNOSTICS
-# ============================================================================
-
-def sip_engine_health(
-) -> Dict[str, Any]:
-    """
-    Return current SIP runtime configuration and lifecycle diagnostics.
-
-    No broker/network operations are performed.
-    """
-
-    return {
-        "module": "sip_engine",
-        "status": "READY",
-        "active": (
-            get_sip_engine().active
-            if _SIP_ENGINE is not None
-            else False
-        ),
-        "default_frequency": (
-            _sip_default_frequency()
-        ),
-        "default_duration_days": (
-            _sip_default_duration_days()
-        ),
-        "min_sip_amount": (
-            _sip_min_amount()
-        ),
-        "decision_history_limit": (
-            _sip_decision_history_limit()
-        ),
-        "broker_execution": False,
-    }
-
-
-# ============================================================================
 # GLOBAL SIP ENGINE
 # ============================================================================
 
-_SIP_ENGINE: Optional[
-    SIPEngine
-] = None
+_SIP_ENGINE: Optional[SIPEngine] = None
 
 _SIP_ENGINE_LOCK = threading.RLock()
 
@@ -2035,8 +1599,7 @@ _SIP_ENGINE_LOCK = threading.RLock()
 # GLOBAL ENGINE ACCESS
 # ============================================================================
 
-def get_sip_engine(
-) -> SIPEngine:
+def get_sip_engine() -> SIPEngine:
     """
     Return the global SIP engine instance.
 
@@ -2050,7 +1613,6 @@ def get_sip_engine(
     with _SIP_ENGINE_LOCK:
 
         if _SIP_ENGINE is None:
-
             _SIP_ENGINE = SIPEngine()
 
             logger.info(
@@ -2093,8 +1655,7 @@ def deactivate_sip(
     )
 
 
-def get_sip_status(
-) -> Dict[str, Any]:
+def get_sip_status() -> Dict[str, Any]:
     """
     Return the global SIP engine status.
     """
@@ -2107,18 +1668,13 @@ def get_sip_status(
 def create_sip_target(
     asset: str,
     amount: float,
-    frequency: Optional[str] = None,
-    duration_days: Optional[int] = None,
+    frequency: str = DEFAULT_FREQUENCY,
+    duration_days: int = DEFAULT_DURATION_DAYS,
     start_at: Optional[dt.datetime] = None,
-    metadata: Optional[
-        Dict[str, Any]
-    ] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> SIPTarget:
     """
     Create a SIP target through the global SIP engine.
-
-    When frequency or duration_days is omitted, their values are resolved
-    from settings.json at call time.
     """
 
     engine = get_sip_engine()
@@ -2145,24 +1701,12 @@ def record_sip_decision(
     trend: Optional[str] = None,
     market_condition: Optional[str] = None,
     allocation: Optional[float] = None,
-    technical_signals: Optional[
-        Dict[str, Any]
-    ] = None,
-    market_context: Optional[
-        Dict[str, Any]
-    ] = None,
-    risk_checks: Optional[
-        Dict[str, Any]
-    ] = None,
-    risk_passed: Optional[
-        bool
-    ] = None,
-    metadata: Optional[
-        Dict[str, Any]
-    ] = None,
-    timestamp: Optional[
-        dt.datetime
-    ] = None,
+    technical_signals: Optional[Dict[str, Any]] = None,
+    market_context: Optional[Dict[str, Any]] = None,
+    risk_checks: Optional[Dict[str, Any]] = None,
+    risk_passed: Optional[bool] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    timestamp: Optional[dt.datetime] = None,
 ) -> SIPDecision:
     """
     Record a decision through the global SIP engine.
@@ -2190,8 +1734,7 @@ def record_sip_decision(
     )
 
 
-def refresh_sip(
-) -> List[SIPTarget]:
+def refresh_sip() -> List[SIPTarget]:
     """
     Refresh the global SIP engine's target states.
     """

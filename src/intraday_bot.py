@@ -67,6 +67,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import math
+import os
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -80,7 +81,7 @@ from decision_engine import (
 )
 from mng_db import DatabaseManager
 from tickers import get_dynamic_tickers
-from utils import clean_ticker_symbol, get_setting
+from utils import clean_ticker_symbol
 
 
 # ============================================================================
@@ -106,11 +107,13 @@ IST = dt.timezone(
 MARKET_OPEN = dt.time(
     9,
     15,
+    tzinfo=IST,
 )
 
 MARKET_CLOSE = dt.time(
     15,
     30,
+    tzinfo=IST,
 )
 
 OWNER = "ASTRA_INTRADAY"
@@ -284,67 +287,154 @@ class PaperExecutor:
 # CONFIGURATION
 # ============================================================================
 
+def _env(
+    name: str,
+    default: str,
+) -> str:
+
+    value = os.getenv(
+        name,
+        default,
+    )
+
+    if value is None:
+        return default
+
+    return str(value).strip()
+
+
+def _env_int(
+    name: str,
+    default: int,
+    minimum: int = 0,
+) -> int:
+
+    try:
+        value = int(
+            _env(
+                name,
+                str(default),
+            )
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        value = default
+
+    return max(
+        minimum,
+        value,
+    )
+
+
+def _env_float(
+    name: str,
+    default: float,
+    minimum: Optional[float] = None,
+) -> float:
+
+    try:
+        value = float(
+            _env(
+                name,
+                str(default),
+            )
+        )
+    except (
+        TypeError,
+        ValueError,
+    ):
+        value = default
+
+    if minimum is not None:
+        value = max(
+            minimum,
+            value,
+        )
+
+    return value
+
+
+def _env_bool(
+    name: str,
+    default: bool,
+) -> bool:
+
+    return (
+        _env(
+            name,
+            str(default),
+        )
+        .lower()
+        in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    )
+
+
 class BotConfig:
     """
     Runtime configuration for the intraday analysis engine.
-
-    Non-secret runtime settings are loaded from the project-level
-    ``settings.json`` through the shared settings controller in ``utils``.
-
-    Secrets and infrastructure credentials remain outside this module.
     """
 
     def __init__(self) -> None:
 
-        self.scan_interval = max(
-            15,
-            _setting_int(
-                "INTRADAY.SCAN_INTERVAL_SECONDS",
-                180,
+        self.scan_interval = _env_int(
+            "INTRADAY_SCAN_INTERVAL_SECONDS",
+            180,
+            minimum=15,
+        )
+
+        self.tickers_count = _env_int(
+            "INTRADAY_TICKERS_COUNT",
+            _env_int(
+                "TICKERS_COUNT",
+                50,
+                minimum=1,
+            ),
+            minimum=1,
+        )
+
+        self.rsi_lower = _env_float(
+            "INTRADAY_RSI_LOWER_THRESHOLD",
+            _env_float(
+                "RSI_LOWER_THRESHOLD",
+                35.0,
             ),
         )
 
-        self.tickers_count = max(
-            1,
-            _setting_int(
-                "INTRADAY.TICKERS_COUNT",
-                _setting_int(
-                    "NORMAL_TRADING.TICKERS_COUNT",
-                    50,
-                ),
+        self.rsi_upper = _env_float(
+            "INTRADAY_RSI_UPPER_THRESHOLD",
+            _env_float(
+                "RSI_UPPER_THRESHOLD",
+                65.0,
             ),
-        )
-
-        self.rsi_lower = _setting_float(
-            "INTRADAY.RSI_LOWER_THRESHOLD",
-            35.0,
-        )
-
-        self.rsi_upper = _setting_float(
-            "INTRADAY.RSI_UPPER_THRESHOLD",
-            65.0,
         )
 
         self.stop_loss_pct = abs(
-            _setting_float(
-                "INTRADAY.STOP_LOSS_PCT",
+            _env_float(
+                "INTRADAY_STOP_LOSS_PCT",
                 0.03,
             )
         )
 
         self.trailing_stop_pct = abs(
-            _setting_float(
-                "INTRADAY.TRAILING_STOP_PCT",
+            _env_float(
+                "INTRADAY_TRAILING_STOP_PCT",
                 0.02,
             )
         )
 
         self.min_alloc = max(
             0.0,
-            _setting_float(
-                "INTRADAY.MIN_ALLOCATION",
-                _setting_float(
-                    "NORMAL_TRADING.MIN_TRADE_ALLOCATION",
+            _env_float(
+                "INTRADAY_MIN_ALLOCATION",
+                _env_float(
+                    "MIN_TRADE_ALLOCATION",
                     100.0,
                 ),
             ),
@@ -352,10 +442,10 @@ class BotConfig:
 
         self.max_alloc = max(
             self.min_alloc,
-            _setting_float(
-                "INTRADAY.MAX_ALLOCATION",
-                _setting_float(
-                    "NORMAL_TRADING.MAX_TRADE_ALLOCATION",
+            _env_float(
+                "INTRADAY_MAX_ALLOCATION",
+                _env_float(
+                    "MAX_TRADE_ALLOCATION",
                     500.0,
                 ),
             ),
@@ -363,52 +453,39 @@ class BotConfig:
 
         self.alloc_pct = max(
             0.0,
-            _setting_float(
-                "INTRADAY.PORTFOLIO_ALLOCATION_PCT",
-                _setting_float(
-                    "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT",
+            _env_float(
+                "INTRADAY_PORTFOLIO_ALLOCATION_PCT",
+                _env_float(
+                    "PORTFOLIO_ALLOCATION_PCT",
                     0.10,
                 ),
             ),
         )
 
-        self.max_positions = max(
-            1,
-            _setting_int(
-                "INTRADAY.MAX_POSITIONS",
-                5,
-            ),
+        self.max_positions = _env_int(
+            "INTRADAY_MAX_POSITIONS",
+            5,
+            minimum=1,
         )
 
         self.max_daily_loss = abs(
-            _setting_float(
-                "INTRADAY.MAX_DAILY_LOSS",
+            _env_float(
+                "INTRADAY_MAX_DAILY_LOSS",
                 0.02,
             )
         )
 
-        self.live_trading_requested = _setting_bool(
-            "INTRADAY.LIVE_TRADING",
+        self.live_trading_requested = _env_bool(
+            "ASTRA_INTRADAY_LIVE_TRADING",
             False,
         )
 
-        self.enable_trailing_stop = _setting_bool(
-            "INTRADAY.ENABLE_TRAILING_STOP",
-            _setting_bool(
-                "NORMAL_TRADING.ENABLE_TRAILING_STOP",
-                True,
-            ),
+        self.enable_trailing_stop = _env_bool(
+            "ENABLE_TRAILING_STOP",
+            True,
         )
 
         self.force_exit_enabled = True
-
-        self.force_exit_time = str(
-            get_setting(
-                "INTRADAY.FORCE_EXIT_TIME",
-                "15:30",
-            )
-            or "15:30"
-        ).strip()
 
         # This module never submits live broker orders.
         self.execution_mode = "ADVISORY"
@@ -430,86 +507,8 @@ class BotConfig:
             "live_trading_requested": (
                 self.live_trading_requested
             ),
-            "enable_trailing_stop": (
-                self.enable_trailing_stop
-            ),
-            "force_exit_time": self.force_exit_time,
             "execution_mode": self.execution_mode,
         }
-
-
-def _setting_int(
-    path: str,
-    default: int,
-    minimum: Optional[int] = None,
-) -> int:
-    """Read an integer runtime setting with safe fallback/clamping."""
-
-    try:
-        value = int(get_setting(path, default))
-    except (TypeError, ValueError):
-        value = default
-
-    if minimum is not None:
-        value = max(minimum, value)
-
-    return value
-
-
-def _setting_float(
-    path: str,
-    default: float,
-    minimum: Optional[float] = None,
-) -> float:
-    """Read a floating-point runtime setting with safe fallback/clamping."""
-
-    try:
-        value = float(get_setting(path, default))
-    except (TypeError, ValueError):
-        value = default
-
-    if minimum is not None:
-        value = max(minimum, value)
-
-    return value
-
-
-def _setting_bool(
-    path: str,
-    default: bool,
-) -> bool:
-    """Read a boolean runtime setting with safe fallback."""
-
-    value = get_setting(path, default)
-
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, (int, float)):
-        return bool(value)
-
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-
-        if normalized in {
-            "1",
-            "true",
-            "yes",
-            "on",
-            "enabled",
-        }:
-            return True
-
-        if normalized in {
-            "0",
-            "false",
-            "no",
-            "off",
-            "disabled",
-        }:
-            return False
-
-    return default
 
 
 # ============================================================================
@@ -599,7 +598,7 @@ class SessionGate:
 
             return (
                 MARKET_OPEN
-                <= now.time()
+                <= now.timetz()
                 < MARKET_CLOSE
             )
 
@@ -631,7 +630,7 @@ class SessionGate:
                 return False
 
             return (
-                now.time()
+                now.timetz()
                 >= MARKET_CLOSE
             )
 
@@ -1522,7 +1521,17 @@ class SmartIntradayBot:
     def activate(
         self,
         session_date: Optional[str] = None,
+        expires_at: Optional[dt.datetime] = None,
     ) -> bool:
+        """Activate the shared intraday session for the current NSE day.
+
+        ``expires_at`` is accepted for compatibility with older callers, but
+        the session expiry is always normalized to the configured NSE close
+        (15:30 IST) unless an explicit timezone-aware value is supplied.
+
+        Activation is persisted in the database so Telegram status, the main
+        scheduler, and a restarted process all have a common session record.
+        """
 
         now = dt.datetime.now(IST)
 
@@ -1533,7 +1542,7 @@ class SmartIntradayBot:
             return False
 
         if not (
-            MARKET_OPEN <= now.time() < MARKET_CLOSE
+            MARKET_OPEN <= now.timetz() < MARKET_CLOSE
         ):
             logger.warning(
                 "SMART INTRADAY ACTIVATION BLOCKED | "
@@ -1547,21 +1556,71 @@ class SmartIntradayBot:
             or now.date().isoformat()
         )
 
-        expiry = dt.datetime.combine(
-            now.date(),
-            MARKET_CLOSE,
-            tzinfo=IST,
-        )
+        if expires_at is None:
+            expiry = dt.datetime.combine(
+                now.date(),
+                MARKET_CLOSE,
+                tzinfo=IST,
+            )
+        else:
+            expiry = expires_at
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=IST)
+            else:
+                expiry = expiry.astimezone(IST)
+
+        # Prevent a stale/non-current session from being activated accidentally.
+        if date_text != now.date().isoformat():
+            logger.warning(
+                "SMART INTRADAY ACTIVATION BLOCKED | session_date=%s is not today=%s",
+                date_text,
+                now.date().isoformat(),
+            )
+            return False
 
         self.gate.activate(
             date_text,
             expiry,
         )
 
+        try:
+            create_session = getattr(
+                self.db,
+                "create_intraday_session",
+                None,
+            )
+            if callable(create_session):
+                # Close any previous unfinished record for this trading date
+                # before creating the authoritative current session record.
+                close_session = getattr(
+                    self.db,
+                    "close_intraday_session",
+                    None,
+                )
+                if callable(close_session):
+                    close_session(
+                        date_text,
+                        "SESSION_REACTIVATED",
+                    )
+
+                create_session(
+                    date_text,
+                    "DAILY",
+                    now.isoformat(),
+                    expiry.isoformat(),
+                )
+        except Exception:
+            # DB persistence is telemetry/state recovery; it must never prevent
+            # the in-memory advisory engine from becoming active.
+            logger.exception(
+                "Failed to persist Smart Intraday activation state."
+            )
+
         logger.warning(
-            "SMART INTRADAY ACTIVATED | live=%s | date=%s",
+            "SMART INTRADAY ACTIVATED | live=%s | date=%s | expiry=%s",
             self.config.live_trading_requested,
             date_text,
+            expiry.isoformat(),
         )
 
         return True
@@ -1571,7 +1630,25 @@ class SmartIntradayBot:
         reason: str = "MANUAL_STOP",
     ) -> None:
 
+        session_date = self.gate.session_date
         self.gate.stop()
+
+        if session_date:
+            try:
+                close_session = getattr(
+                    self.db,
+                    "close_intraday_session",
+                    None,
+                )
+                if callable(close_session):
+                    close_session(
+                        session_date,
+                        reason,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to persist Smart Intraday stop state."
+                )
 
         logger.warning(
             "SMART INTRADAY STOPPED | %s",
@@ -1580,7 +1657,25 @@ class SmartIntradayBot:
 
     def kill(self) -> None:
 
+        session_date = self.gate.session_date
         self.gate.kill()
+
+        if session_date:
+            try:
+                close_session = getattr(
+                    self.db,
+                    "close_intraday_session",
+                    None,
+                )
+                if callable(close_session):
+                    close_session(
+                        session_date,
+                        "KILLED",
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to persist Smart Intraday kill state."
+                )
 
         logger.critical(
             "SMART INTRADAY KILLED"
@@ -1855,35 +1950,41 @@ class SmartIntradayBot:
             for p in self.ledger.positions()
         }
 
-        symbols: list[str] = []
+        # Normalize to Yahoo symbols BEFORE constructing the lookup list.
+        # Broker symbols such as ``MARUTI-EQ`` must never reach yfinance.
+        yahoo_symbols: list[str] = []
+        broker_symbols: list[str] = []
+        seen_yahoo: set[str] = set()
 
         for ticker in tickers:
 
             try:
 
-                symbol = clean_ticker_symbol(
+                broker_symbol = clean_ticker_symbol(
                     ticker
+                )
+                yahoo_symbol = self._yahoo(
+                    broker_symbol
                 )
 
             except Exception:
 
                 continue
 
-            if not symbol:
+            if not broker_symbol or not yahoo_symbol:
                 continue
 
-            if symbol in owned:
+            if broker_symbol in owned:
                 continue
 
-            if symbol not in symbols:
-                symbols.append(
-                    symbol
-                )
+            if yahoo_symbol in seen_yahoo:
+                continue
 
-        yahoo_symbols = [
-            self._yahoo(symbol)
-            for symbol in symbols
-        ]
+            seen_yahoo.add(yahoo_symbol)
+            broker_symbols.append(broker_symbol)
+            yahoo_symbols.append(yahoo_symbol)
+
+        symbols = broker_symbols
 
         if not yahoo_symbols:
 
@@ -2760,46 +2861,132 @@ class SmartIntradayBot:
     def _yahoo(
         ticker: str,
     ) -> str:
+        """Convert an ASTRA/broker symbol to a Yahoo Finance symbol.
 
-        value = clean_ticker_symbol(
-            ticker
-        )
+        This conversion is deliberately self-contained.  The intraday
+        market-data boundary must not depend on another module's ticker
+        conversion implementation.
 
-        upper = value.upper()
+        Examples:
+            HCLTECH-EQ  -> HCLTECH.NS
+            M&M-EQ      -> M&M.NS
+            BAJAJ-AUTO-EQ -> BAJAJ-AUTO.NS
+            HDFCBANK.NS -> HDFCBANK.NS
+            HDFCBANK.BO -> HDFCBANK.BO
+        """
 
-        for suffix in (
+        value = str(ticker or "").strip().upper()
+        value = value.lstrip("$").replace(" ", "")
+
+        if not value:
+            return ""
+
+        broker_suffixes = (
             "-EQ",
             "-BE",
             "-BL",
             "-BZ",
             "-SM",
             "-ST",
-        ):
+        )
 
-            if upper.endswith(
-                suffix
-            ):
+        # Remove broker/security-series suffixes even when an exchange
+        # suffix has already been attached (for example FOO-EQ.NS).
+        for exchange_suffix in (".NS", ".BO"):
+            if value.endswith(exchange_suffix):
+                base = value[:-len(exchange_suffix)]
+                for broker_suffix in broker_suffixes:
+                    if base.endswith(broker_suffix):
+                        base = base[:-len(broker_suffix)]
+                        break
+                return f"{base}{exchange_suffix}" if base else ""
 
-                upper = upper[
-                    :-len(suffix)
-                ]
-
+        for broker_suffix in broker_suffixes:
+            if value.endswith(broker_suffix):
+                value = value[:-len(broker_suffix)]
                 break
 
-        if upper.endswith(
-            ".NS"
-        ):
+        return f"{value}.NS" if value else ""
 
-            return upper
+    @classmethod
+    def _yahoo_download_symbols(
+        cls,
+        symbols: list[str],
+    ) -> list[str]:
+        """Create the final symbol list handed to yfinance.
 
-        if upper.endswith(
-            ".BO"
-        ):
+        This is intentionally the *last* normalization boundary. Every item
+        is converted again immediately before the network call, even if the
+        caller already supplied a Yahoo-formatted symbol.
+        """
 
-            return upper
+        result: list[str] = []
+        seen: set[str] = set()
 
-        return (
-            f"{upper}.NS"
+        for raw_symbol in symbols:
+            yahoo_symbol = cls._yahoo(raw_symbol)
+
+            if not yahoo_symbol:
+                continue
+
+            if yahoo_symbol in seen:
+                continue
+
+            seen.add(yahoo_symbol)
+            result.append(yahoo_symbol)
+
+        return result
+
+    @classmethod
+    def _yf_download(
+        cls,
+        symbols: str | list[str],
+        **kwargs: Any,
+    ) -> Any:
+        """Call yfinance only after a final broker-symbol sanitization pass.
+
+        This wrapper is the only yfinance download boundary in this module.
+        It deliberately accepts raw ASTRA/Angel One symbols and normalizes
+        them itself, making ``*-EQ`` leakage into yfinance impossible.
+        """
+
+        raw_symbols = [symbols] if isinstance(symbols, str) else list(symbols)
+        yahoo_symbols = cls._yahoo_download_symbols(raw_symbols)
+
+        if not yahoo_symbols:
+            return None
+
+        final_symbols: str | list[str]
+        if len(yahoo_symbols) == 1 and isinstance(symbols, str):
+            final_symbols = yahoo_symbols[0]
+        else:
+            final_symbols = yahoo_symbols
+
+        # Diagnostic assertion: this is intentionally before the network call.
+        invalid = [
+            symbol
+            for symbol in (
+                [final_symbols]
+                if isinstance(final_symbols, str)
+                else final_symbols
+            )
+            if symbol.endswith(
+                ("-EQ", "-BE", "-BL", "-BZ", "-SM", "-ST")
+            )
+        ]
+        if invalid:
+            raise ValueError(
+                f"Unsafe broker symbols reached yfinance boundary: {invalid!r}"
+            )
+
+        logger.debug(
+            "yfinance request symbols sanitized: %s",
+            final_symbols,
+        )
+
+        return yf.download(
+            final_symbols,
+            **kwargs,
         )
 
     # ========================================================================
@@ -2812,13 +2999,21 @@ class SmartIntradayBot:
     ) -> Any:
 
         if not symbols:
+            return None
 
+        # HARD MARKET-DATA BOUNDARY:
+        # No broker-format symbol is ever allowed to reach yfinance.
+        # This protects every caller, even if it passes raw ``*-EQ`` symbols.
+        yahoo_symbols = self._yahoo_download_symbols(
+            symbols
+        )
+
+        if not yahoo_symbols:
             return None
 
         try:
-
-            data = yf.download(
-                symbols,
+            data = self._yf_download(
+                yahoo_symbols,
                 period="5d",
                 interval="5m",
                 group_by="ticker",
@@ -2828,29 +3023,22 @@ class SmartIntradayBot:
             )
 
         except Exception:
-
             logger.warning(
                 "Intraday market-data download failed."
             )
-
             logger.debug(
                 "yfinance exception.",
                 exc_info=True,
             )
-
             return None
 
         if data is None:
-
             return None
 
         try:
-
             if data.empty:
                 return None
-
         except Exception:
-
             return None
 
         return data
@@ -2988,7 +3176,17 @@ class SmartIntradayBot:
 
         try:
 
-            data = yf.download(
+            # ``symbol`` has already crossed the same self-contained Yahoo
+            # normalization boundary used by the bulk downloader.
+            normalized_symbols = self._yahoo_download_symbols(
+                [symbol]
+            )
+            if not normalized_symbols:
+                return 0.0
+
+            symbol = normalized_symbols[0]
+
+            data = self._yf_download(
                 symbol,
                 period="1d",
                 interval="5m",
