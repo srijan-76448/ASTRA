@@ -33,6 +33,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from mng_db import DatabaseManager
+from utils import get_setting, get_settings, update_setting
 
 
 BASE_DIR = (
@@ -45,6 +46,38 @@ BASE_DIR = (
 load_dotenv(
     BASE_DIR / ".env",
     override=True,
+)
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    """Read a boolean infrastructure flag from .env."""
+
+    value = os.getenv(key)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+# Always-active flags are infrastructure/runtime-startup controls kept in
+# .env. They are intentionally not part of settings.json or /set.
+ALWAYS_ACTIVE_INTRADAY = _env_bool(
+    "ALWAYS_ACTIVE_INTRADAY",
+    False,
+)
+ALWAYS_ACTIVE_SIP = _env_bool(
+    "ALWAYS_ACTIVE_SIP",
+    False,
+)
+ALWAYS_ACTIVE_IPO = _env_bool(
+    "ALWAYS_ACTIVE_IPO",
+    False,
 )
 
 logger = logging.getLogger(
@@ -261,72 +294,25 @@ def get_env(
     key: str,
     default: str = "",
 ) -> str:
-    """Return a runtime override when present, otherwise .env."""
+    """Return a runtime setting with legacy .env fallback.
+
+    Runtime application settings live in settings.json. Critical
+    infrastructure/secret values continue to come from .env.
+    """
 
     if key in RUNTIME_CONFIG:
         return RUNTIME_CONFIG[key]
+
+    setting_path = _ENV_TO_SETTING_PATH.get(key.upper())
+    if setting_path:
+        value = get_setting(setting_path, None)
+        if value is not None:
+            return str(value)
 
     return os.getenv(
         key,
         default,
     )
-
-
-def _env_bool(
-    key: str,
-    default: bool = False,
-) -> bool:
-    """Read a boolean infrastructure override from .env."""
-
-    raw = os.getenv(key)
-
-    if raw is None:
-        return default
-
-    normalized = str(raw).strip().lower()
-
-    if normalized in {
-        "1",
-        "true",
-        "yes",
-        "on",
-        "enabled",
-    }:
-        return True
-
-    if normalized in {
-        "0",
-        "false",
-        "no",
-        "off",
-        "disabled",
-    }:
-        return False
-
-    logger.warning(
-        "Invalid boolean value for %s=%r; using %s.",
-        key,
-        raw,
-        default,
-    )
-
-    return default
-
-
-ALWAYS_ACTIVE_INTRADAY = _env_bool(
-    "ALWAYS_ACTIVE_INTRADAY",
-    False,
-)
-
-ALWAYS_ACTIVE_SIP = _env_bool(
-    "ALWAYS_ACTIVE_SIP",
-    False,
-)
-
-ALWAYS_ACTIVE_IPO = _env_bool(
-    "ALWAYS_ACTIVE_IPO",
-    False,
-)
 
 
 def _get_int(
@@ -1138,43 +1124,104 @@ def _get_admin_password() -> str:
     )
 
 
+# Canonical runtime settings exposed through /config and /set.
+# The keys are intentionally mapped to the exact settings.json paths.
 _CONFIGURABLE_SETTINGS = (
-    "ASTRA_CYCLE_BUFFER",
-    "NOTIFICATION_REPEAT_BUFFER",
-    "TICKERS_COUNT",
-    "MIN_TRADE_ALLOCATION",
-    "MAX_TRADE_ALLOCATION",
-    "PORTFOLIO_ALLOCATION_PCT",
-    "RSI_LOWER_THRESHOLD",
-    "RSI_UPPER_THRESHOLD",
-    "ENABLE_TRAILING_STOP",
-    "STOP_LOSS_PCT",
-    "TRAILING_STOP_PCT",
-    "INTRADAY_TRADING_ENGINE",
-    "ASTRA_INTRADAY_LIVE_TRADING",
-    "INTRADAY_TICKERS_COUNT",
-    "INTRADAY_SCAN_INTERVAL_SECONDS",
-    "INTRADAY_RSI_LOWER_THRESHOLD",
-    "INTRADAY_RSI_UPPER_THRESHOLD",
-    "INTRADAY_MIN_ALLOCATION",
-    "INTRADAY_MAX_ALLOCATION",
-    "INTRADAY_MAX_POSITIONS",
-    "INTRADAY_MAX_DAILY_LOSS",
-    "INTRADAY_STOP_LOSS_PCT",
-    "INTRADAY_TRAILING_STOP_PCT",
-    "INTRADAY_FORCE_EXIT_TIME",
-    "ASTRA_OFFMARKET_CYCLE_MINUTES",
-    "ASTRA_OFFMARKET_WALLET_REFRESH_MINUTES",
+    "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER",
+    "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER",
+    "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER",
+    "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER",
+    "ASTRA_FUNCTIONS.KILL",
+    "NORMAL_TRADING.TICKERS_COUNT",
+    "NORMAL_TRADING.MIN_TRADE_ALLOCATION",
+    "NORMAL_TRADING.MAX_TRADE_ALLOCATION",
+    "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT",
+    "NORMAL_TRADING.RSI_LOWER_THRESHOLD",
+    "NORMAL_TRADING.RSI_UPPER_THRESHOLD",
+    "NORMAL_TRADING.ENABLE_TRAILING_STOP",
+    "NORMAL_TRADING.STOP_LOSS_PCT",
+    "NORMAL_TRADING.TRAILING_STOP_PCT",
+    "INTRADAY.TRADING_ENGINE",
+    "INTRADAY.LIVE_TRADING",
+    "INTRADAY.TICKERS_COUNT",
+    "INTRADAY.SCAN_INTERVAL_SECONDS",
+    "INTRADAY.RSI_LOWER_THRESHOLD",
+    "INTRADAY.RSI_UPPER_THRESHOLD",
+    "INTRADAY.MIN_ALLOCATION",
+    "INTRADAY.MAX_ALLOCATION",
+    "INTRADAY.MAX_POSITIONS",
+    "INTRADAY.MAX_DAILY_LOSS",
+    "INTRADAY.STOP_LOSS_PCT",
+    "INTRADAY.TRAILING_STOP_PCT",
+    "INTRADAY.FORCE_EXIT_TIME",
+    "mailer.TIME",
 )
 
+# Legacy environment names still used by older runtime code are resolved
+# against settings.json first. Secrets and infrastructure variables are not
+# included here and therefore remain .env-only.
+_ENV_TO_SETTING_PATH = {
+    "ASTRA_CYCLE_BUFFER": "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER",
+    "ACTIVE_CYCLE_BUFFER": "ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER",
+    "PASSIVE_CYCLE_BUFFER": "ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER",
+    "NOTIFICATION_REPEAT_BUFFER": "ASTRA_FUNCTIONS.NOTIFICATION_REPEAT_BUFFER",
+    "PASSIVE_WALLET_REFRESH_BUFFER": "ASTRA_FUNCTIONS.PASSIVE_WALLET_REFRESH_BUFFER",
+    "TICKERS_COUNT": "NORMAL_TRADING.TICKERS_COUNT",
+    "MIN_TRADE_ALLOCATION": "NORMAL_TRADING.MIN_TRADE_ALLOCATION",
+    "MAX_TRADE_ALLOCATION": "NORMAL_TRADING.MAX_TRADE_ALLOCATION",
+    "PORTFOLIO_ALLOCATION_PCT": "NORMAL_TRADING.PORTFOLIO_ALLOCATION_PCT",
+    "RSI_LOWER_THRESHOLD": "NORMAL_TRADING.RSI_LOWER_THRESHOLD",
+    "RSI_UPPER_THRESHOLD": "NORMAL_TRADING.RSI_UPPER_THRESHOLD",
+    "ENABLE_TRAILING_STOP": "NORMAL_TRADING.ENABLE_TRAILING_STOP",
+    "STOP_LOSS_PCT": "NORMAL_TRADING.STOP_LOSS_PCT",
+    "TRAILING_STOP_PCT": "NORMAL_TRADING.TRAILING_STOP_PCT",
+    "INTRADAY_TRADING_ENGINE": "INTRADAY.TRADING_ENGINE",
+    "ASTRA_INTRADAY_LIVE_TRADING": "INTRADAY.LIVE_TRADING",
+    "INTRADAY_TICKERS_COUNT": "INTRADAY.TICKERS_COUNT",
+    "INTRADAY_SCAN_INTERVAL_SECONDS": "INTRADAY.SCAN_INTERVAL_SECONDS",
+    "INTRADAY_RSI_LOWER_THRESHOLD": "INTRADAY.RSI_LOWER_THRESHOLD",
+    "INTRADAY_RSI_UPPER_THRESHOLD": "INTRADAY.RSI_UPPER_THRESHOLD",
+    "INTRADAY_MIN_ALLOCATION": "INTRADAY.MIN_ALLOCATION",
+    "INTRADAY_MAX_ALLOCATION": "INTRADAY.MAX_ALLOCATION",
+    "INTRADAY_MAX_POSITIONS": "INTRADAY.MAX_POSITIONS",
+    "INTRADAY_MAX_DAILY_LOSS": "INTRADAY.MAX_DAILY_LOSS",
+    "INTRADAY_STOP_LOSS_PCT": "INTRADAY.STOP_LOSS_PCT",
+    "INTRADAY_TRAILING_STOP_PCT": "INTRADAY.TRAILING_STOP_PCT",
+    "INTRADAY_FORCE_EXIT_TIME": "INTRADAY.FORCE_EXIT_TIME",
+}
 
-def _set_value_is_valid(
-    key: str,
-    value: str,
-) -> bool:
-    """Return whether a setting is safe to expose through /set and /config."""
+_SETTING_PATH_LOOKUP = {path.lower(): path for path in _CONFIGURABLE_SETTINGS}
 
-    return key in _CONFIGURABLE_SETTINGS and bool(value)
+
+def _canonical_setting_path(value: str) -> Optional[str]:
+    """Resolve a case-insensitive dotted settings path."""
+    return _SETTING_PATH_LOOKUP.get(value.strip().lower())
+
+
+def _coerce_setting_value(path: str, raw_value: str) -> Any:
+    """Convert Telegram text into the type already used by settings.json."""
+    raw = raw_value.strip()
+    current = get_setting(path, None)
+
+    if isinstance(current, bool):
+        lowered = raw.lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError("expected true or false")
+
+    if isinstance(current, int) and not isinstance(current, bool):
+        return int(raw)
+
+    if isinstance(current, float):
+        return float(raw)
+
+    return raw
+
+
+def _set_value_is_valid(path: str, value: str) -> bool:
+    return bool(path and value.strip())
 
 
 async def cmd_set(
@@ -1182,84 +1229,63 @@ async def cmd_set(
     context,
 ):
 
-    args = list(
-        getattr(
-            context,
-            "args",
-            [],
-        )
-        or []
-    )
+    args = list(getattr(context, "args", []) or [])
 
     if len(args) < 3:
-
         await update.message.reply_text(
-            (
-                "❌ Invalid syntax.\n\n"
-                "/set &lt;password&gt; &lt;SETTING&gt; &lt;VALUE&gt;"
-            ),
+            "❌ Invalid syntax.\n\n"
+            "/set &lt;password&gt; &lt;path&gt; &lt;value&gt;",
             parse_mode="HTML",
         )
-
         return
 
     password = args[0]
-    key = args[1].strip().upper()
-    value = " ".join(
-        args[2:]
-    ).strip()
+    requested_path = args[1].strip()
+    raw_value = " ".join(args[2:]).strip()
 
     configured_password = _get_admin_password()
-
     if (
         not configured_password
         or not password
-        or not __import__("secrets").compare_digest(
-            password,
-            configured_password,
-        )
+        or not __import__("secrets").compare_digest(password, configured_password)
     ):
-
-        # Never log, echo or otherwise expose the supplied password.
-        logger.warning(
-            "Rejected unauthenticated /set request."
-        )
-
-        await update.message.reply_text(
-            "❌ Authentication failed."
-        )
-
+        logger.warning("Rejected unauthenticated /set request.")
+        await update.message.reply_text("❌ Authentication failed.")
         return
 
-    if not _set_value_is_valid(
-        key,
-        value,
-    ):
-
+    path = _canonical_setting_path(requested_path)
+    if not path or not _set_value_is_valid(path, raw_value):
         await update.message.reply_text(
-            (
-                "❌ Unsupported runtime setting.\n\n"
-                "The requested setting is not permitted "
-                "through /set."
-            )
+            "❌ Unsupported runtime setting.\n\n"
+            "Use a permitted settings.json path such as "
+            "<code>mailer.time</code>.",
+            parse_mode="HTML",
         )
-
         return
 
-    RUNTIME_CONFIG[key] = value
+    try:
+        value = _coerce_setting_value(path, raw_value)
+        update_setting(path, value, persist=True)
+    except (TypeError, ValueError) as exc:
+        await update.message.reply_text(
+            f"❌ Invalid value for <code>{escape(path)}</code>: "
+            f"{escape(str(exc))}",
+            parse_mode="HTML",
+        )
+        return
+    except Exception:
+        logger.exception("Failed to persist runtime setting: %s", path)
+        await update.message.reply_text(
+            "❌ Failed to persist the runtime setting.",
+        )
+        return
 
-    logger.info(
-        "Runtime configuration updated: %s",
-        key,
-    )
-
+    logger.info("Runtime configuration updated: %s", path)
     await update.message.reply_text(
-        (
-            "🟢 <b>Runtime configuration updated.</b>\n\n"
-            f"Setting: <code>{escape(key)}</code>\n"
-            f"Value: <code>{escape(value)}</code>\n\n"
-            "The .env file was not modified."
-        ),
+        "🟢 <b>Runtime configuration updated.</b>\n\n"
+        f"Setting: <code>{escape(path)}</code>\n"
+        f"Value: <code>{escape(str(value))}</code>\n\n"
+        "<code>settings.json</code> was updated.",
         parse_mode="HTML",
     )
 
@@ -1611,29 +1637,43 @@ async def cmd_config(
     update,
     context,
 ):
-    """Show only settings that are explicitly configurable through /set."""
+    """Show runtime settings in the same structure as settings.json."""
+
+    settings = get_settings()
 
     lines = [
-        "<b>ASTRA Configurable Settings</b>",
+        "<b>ASTRA Runtime Configuration</b>",
         "",
     ]
 
-    for key in _CONFIGURABLE_SETTINGS:
-        value = get_env(key, "")
-        if key == "INTRADAY_FORCE_EXIT_TIME":
-            value = value or "15:30"
-        lines.append(
-            f"<b>{escape(key)}</b>: "
-            f"<code>{escape(str(value))}</code>"
-        )
-
-    lines.extend(
-        [
-            "",
-            "<i>Only non-critical runtime-configurable settings are shown.</i>",
-            "<i>Runtime overrides do not modify .env.</i>",
-        ]
+    sections = (
+        "ASTRA_FUNCTIONS",
+        "NORMAL_TRADING",
+        "INTRADAY",
+        "mailer",
+        "SIP",
+        "IPO",
     )
+
+    for section in sections:
+        lines.append(f"<b>[{escape(section)}]</b>")
+        values = settings.get(section, {})
+        if isinstance(values, dict):
+            for key, value in values.items():
+                if isinstance(value, bool):
+                    rendered = "true" if value else "false"
+                elif value is None:
+                    rendered = "null"
+                else:
+                    rendered = str(value)
+                lines.append(
+                    f"{escape(str(key))}: {escape(rendered)}"
+                )
+        lines.append("")
+
+    # Avoid an unnecessary trailing blank line in Telegram.
+    while lines and lines[-1] == "":
+        lines.pop()
 
     await update.message.reply_text(
         "\n".join(lines),

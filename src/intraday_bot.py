@@ -70,10 +70,18 @@ import math
 import os
 import threading
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
 import yfinance as yf
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:  # pragma: no cover - optional runtime dependency
+    gspread = None
+    Credentials = None
 
 from decision_engine import (
     analyze_ticker_data,
@@ -81,7 +89,7 @@ from decision_engine import (
 )
 from mng_db import DatabaseManager
 from tickers import get_dynamic_tickers
-from utils import clean_ticker_symbol
+from utils import get_setting, clean_ticker_symbol, to_yahoo_ticker
 
 
 # ============================================================================
@@ -107,16 +115,96 @@ IST = dt.timezone(
 MARKET_OPEN = dt.time(
     9,
     15,
-    tzinfo=IST,
 )
 
 MARKET_CLOSE = dt.time(
     15,
     30,
-    tzinfo=IST,
 )
 
 OWNER = "ASTRA_INTRADAY"
+
+# Google Sheets dashboard contract for the intraday subsystem. SQLite remains
+# authoritative; this worksheet is a human-readable mirror of ASTRA-owned
+# intraday holdings only.
+INTRADAY_HOLDINGS_TAB = "Intraday Bot Holdings"
+INTRADAY_HOLDINGS_COLUMNS = (
+    "ticker",
+    "quantity",
+    "entry_price",
+    "current_price",
+    "invested_value",
+    "current_value",
+    "pnl",
+    "pnl_pct",
+    "stop_loss",
+    "trailing_stop",
+    "peak_price",
+    "session_date",
+    "status",
+    "owner",
+    "entry_order_id",
+    "exit_order_id",
+)
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+
+
+# ============================================================================
+# GOOGLE SHEETS HELPERS
+# ============================================================================
+
+def _sheet_setting(name: str, default: str = "") -> str:
+    """Read a non-secret Google Sheets runtime setting."""
+
+    try:
+        value = get_setting(
+            name,
+            None,
+        )
+    except Exception:
+        value = None
+
+    if value is None or str(value).strip() == "":
+        value = os.getenv(name.split(".")[-1], default)
+
+    return str(value or default).strip()
+
+
+def _sheet_credentials_path() -> Path:
+    """Resolve the configured Google service-account file."""
+
+    configured = _sheet_setting(
+        "GOOGLE_SHEETS.SERVICE_ACCOUNT_FILE",
+        "service_account.json",
+    )
+
+    path = Path(configured).expanduser()
+
+    if not path.is_absolute():
+        path = BASE_DIR / path
+
+    return path
+
+
+def _serialize_sheet_value(value: Any) -> Any:
+    """Convert an internal value into a Google-Sheets-safe scalar."""
+
+    if value is None:
+        return ""
+
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
+        return value.isoformat()
+
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+
+    if isinstance(value, (str, int, float)):
+        return value
+
+    return str(value)
 
 
 # ============================================================================
@@ -598,7 +686,7 @@ class SessionGate:
 
             return (
                 MARKET_OPEN
-                <= now.timetz()
+                <= now.time()
                 < MARKET_CLOSE
             )
 
@@ -630,7 +718,7 @@ class SessionGate:
                 return False
 
             return (
-                now.timetz()
+                now.time()
                 >= MARKET_CLOSE
             )
 
@@ -1515,23 +1603,156 @@ class SmartIntradayBot:
         ] = None
 
     # ========================================================================
+    # GOOGLE SHEETS
+    # ========================================================================
+
+    def _sync_google_sheet_holdings(self) -> None:
+        """Mirror ASTRA intraday holdings into the dedicated Sheets tab.
+
+        SQLite remains the authoritative state store. This method only
+        publishes the current ASTRA-owned intraday holdings to the
+        ``Intraday Bot Holdings`` worksheet and never writes broker holdings.
+        """
+
+        spreadsheet_id = _sheet_setting(
+            "GOOGLE_SHEETS.SPREADSHEET_ID",
+            "",
+        )
+
+        if not spreadsheet_id:
+            logger.debug(
+                "Intraday Google Sheets sync skipped: spreadsheet ID not configured."
+            )
+            return
+
+        if gspread is None or Credentials is None:
+            logger.warning(
+                "Intraday Google Sheets sync skipped: gspread/google-auth unavailable."
+            )
+            return
+
+        credentials_path = _sheet_credentials_path()
+
+        if not credentials_path.exists():
+            logger.debug(
+                "Intraday Google Sheets sync skipped: credentials file not found: %s",
+                credentials_path,
+            )
+            return
+
+        try:
+            credentials = Credentials.from_service_account_file(
+                str(credentials_path),
+                scopes=[
+                    "https://www.googleapis.com/auth/spreadsheets",
+                ],
+            )
+
+            client = gspread.authorize(credentials)
+            spreadsheet = client.open_by_key(spreadsheet_id)
+
+            try:
+                worksheet = spreadsheet.worksheet(
+                    INTRADAY_HOLDINGS_TAB
+                )
+            except gspread.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(
+                    title=INTRADAY_HOLDINGS_TAB,
+                    rows=max(100, len(INTRADAY_HOLDINGS_COLUMNS) + 10),
+                    cols=len(INTRADAY_HOLDINGS_COLUMNS),
+                )
+
+            positions = self.ledger.positions()
+
+            rows: list[list[Any]] = [
+                list(INTRADAY_HOLDINGS_COLUMNS)
+            ]
+
+            for position in positions:
+                invested_value = (
+                    position.entry_price
+                    * position.quantity
+                )
+                current_value = (
+                    position.current_price
+                    * position.quantity
+                )
+
+                rows.append([
+                    _serialize_sheet_value(position.ticker),
+                    _serialize_sheet_value(position.quantity),
+                    _serialize_sheet_value(position.entry_price),
+                    _serialize_sheet_value(position.current_price),
+                    _serialize_sheet_value(invested_value),
+                    _serialize_sheet_value(current_value),
+                    _serialize_sheet_value(position.pnl),
+                    _serialize_sheet_value(position.pnl_pct),
+                    _serialize_sheet_value(position.stop_loss),
+                    _serialize_sheet_value(position.trailing_stop),
+                    _serialize_sheet_value(position.peak_price),
+                    _serialize_sheet_value(position.session_date),
+                    _serialize_sheet_value(position.status),
+                    _serialize_sheet_value(position.owner),
+                    _serialize_sheet_value(position.entry_order_id),
+                    _serialize_sheet_value(position.exit_order_id),
+                ])
+
+            required_rows = max(
+                len(rows),
+                2,
+            )
+            required_cols = len(
+                INTRADAY_HOLDINGS_COLUMNS
+            )
+
+            if worksheet.row_count < required_rows:
+                worksheet.resize(
+                    rows=required_rows,
+                    cols=max(worksheet.col_count, required_cols),
+                )
+
+            if worksheet.col_count < required_cols:
+                worksheet.resize(
+                    rows=max(worksheet.row_count, required_rows),
+                    cols=required_cols,
+                )
+
+            worksheet.clear()
+            worksheet.update(
+                range_name="A1",
+                values=rows,
+                raw=True,
+            )
+
+            try:
+                worksheet.freeze(rows=1)
+            except Exception:
+                logger.debug(
+                    "Unable to freeze Intraday Bot Holdings header.",
+                    exc_info=True,
+                )
+
+            logger.debug(
+                "Intraday holdings synced to Google Sheets | tab=%s | open_positions=%d",
+                INTRADAY_HOLDINGS_TAB,
+                len(positions),
+            )
+
+        except Exception:
+            logger.error(
+                "Failed to sync intraday holdings to Google Sheets.",
+                exc_info=True,
+            )
+
+
+    # ========================================================================
     # SESSION CONTROL
     # ========================================================================
 
     def activate(
         self,
         session_date: Optional[str] = None,
-        expires_at: Optional[dt.datetime] = None,
     ) -> bool:
-        """Activate the shared intraday session for the current NSE day.
-
-        ``expires_at`` is accepted for compatibility with older callers, but
-        the session expiry is always normalized to the configured NSE close
-        (15:30 IST) unless an explicit timezone-aware value is supplied.
-
-        Activation is persisted in the database so Telegram status, the main
-        scheduler, and a restarted process all have a common session record.
-        """
 
         now = dt.datetime.now(IST)
 
@@ -1542,7 +1763,7 @@ class SmartIntradayBot:
             return False
 
         if not (
-            MARKET_OPEN <= now.timetz() < MARKET_CLOSE
+            MARKET_OPEN <= now.time() < MARKET_CLOSE
         ):
             logger.warning(
                 "SMART INTRADAY ACTIVATION BLOCKED | "
@@ -1556,71 +1777,23 @@ class SmartIntradayBot:
             or now.date().isoformat()
         )
 
-        if expires_at is None:
-            expiry = dt.datetime.combine(
-                now.date(),
-                MARKET_CLOSE,
-                tzinfo=IST,
-            )
-        else:
-            expiry = expires_at
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=IST)
-            else:
-                expiry = expiry.astimezone(IST)
-
-        # Prevent a stale/non-current session from being activated accidentally.
-        if date_text != now.date().isoformat():
-            logger.warning(
-                "SMART INTRADAY ACTIVATION BLOCKED | session_date=%s is not today=%s",
-                date_text,
-                now.date().isoformat(),
-            )
-            return False
+        expiry = dt.datetime.combine(
+            now.date(),
+            MARKET_CLOSE,
+            tzinfo=IST,
+        )
 
         self.gate.activate(
             date_text,
             expiry,
         )
 
-        try:
-            create_session = getattr(
-                self.db,
-                "create_intraday_session",
-                None,
-            )
-            if callable(create_session):
-                # Close any previous unfinished record for this trading date
-                # before creating the authoritative current session record.
-                close_session = getattr(
-                    self.db,
-                    "close_intraday_session",
-                    None,
-                )
-                if callable(close_session):
-                    close_session(
-                        date_text,
-                        "SESSION_REACTIVATED",
-                    )
-
-                create_session(
-                    date_text,
-                    "DAILY",
-                    now.isoformat(),
-                    expiry.isoformat(),
-                )
-        except Exception:
-            # DB persistence is telemetry/state recovery; it must never prevent
-            # the in-memory advisory engine from becoming active.
-            logger.exception(
-                "Failed to persist Smart Intraday activation state."
-            )
+        self._sync_google_sheet_holdings()
 
         logger.warning(
-            "SMART INTRADAY ACTIVATED | live=%s | date=%s | expiry=%s",
+            "SMART INTRADAY ACTIVATED | live=%s | date=%s",
             self.config.live_trading_requested,
             date_text,
-            expiry.isoformat(),
         )
 
         return True
@@ -1630,25 +1803,8 @@ class SmartIntradayBot:
         reason: str = "MANUAL_STOP",
     ) -> None:
 
-        session_date = self.gate.session_date
         self.gate.stop()
-
-        if session_date:
-            try:
-                close_session = getattr(
-                    self.db,
-                    "close_intraday_session",
-                    None,
-                )
-                if callable(close_session):
-                    close_session(
-                        session_date,
-                        reason,
-                    )
-            except Exception:
-                logger.exception(
-                    "Failed to persist Smart Intraday stop state."
-                )
+        self._sync_google_sheet_holdings()
 
         logger.warning(
             "SMART INTRADAY STOPPED | %s",
@@ -1657,25 +1813,7 @@ class SmartIntradayBot:
 
     def kill(self) -> None:
 
-        session_date = self.gate.session_date
         self.gate.kill()
-
-        if session_date:
-            try:
-                close_session = getattr(
-                    self.db,
-                    "close_intraday_session",
-                    None,
-                )
-                if callable(close_session):
-                    close_session(
-                        session_date,
-                        "KILLED",
-                    )
-            except Exception:
-                logger.exception(
-                    "Failed to persist Smart Intraday kill state."
-                )
 
         logger.critical(
             "SMART INTRADAY KILLED"
@@ -1752,6 +1890,8 @@ class SmartIntradayBot:
                     cash
                 )
             )
+
+            self._sync_google_sheet_holdings()
 
             return {
                 "status": "OK",
@@ -2607,6 +2747,7 @@ class SmartIntradayBot:
 
         if not positions:
 
+            self._sync_google_sheet_holdings()
             self.stop(
                 "DAILY_EXPIRY"
             )
@@ -2752,6 +2893,8 @@ class SmartIntradayBot:
                     exc_info=True,
                 )
 
+        self._sync_google_sheet_holdings()
+
         self.stop(
             "DAILY_EXPIRY"
         )
@@ -2861,132 +3004,10 @@ class SmartIntradayBot:
     def _yahoo(
         ticker: str,
     ) -> str:
-        """Convert an ASTRA/broker symbol to a Yahoo Finance symbol.
+        """Return the cleaned Yahoo Finance symbol used for lookup."""
 
-        This conversion is deliberately self-contained.  The intraday
-        market-data boundary must not depend on another module's ticker
-        conversion implementation.
-
-        Examples:
-            HCLTECH-EQ  -> HCLTECH.NS
-            M&M-EQ      -> M&M.NS
-            BAJAJ-AUTO-EQ -> BAJAJ-AUTO.NS
-            HDFCBANK.NS -> HDFCBANK.NS
-            HDFCBANK.BO -> HDFCBANK.BO
-        """
-
-        value = str(ticker or "").strip().upper()
-        value = value.lstrip("$").replace(" ", "")
-
-        if not value:
-            return ""
-
-        broker_suffixes = (
-            "-EQ",
-            "-BE",
-            "-BL",
-            "-BZ",
-            "-SM",
-            "-ST",
-        )
-
-        # Remove broker/security-series suffixes even when an exchange
-        # suffix has already been attached (for example FOO-EQ.NS).
-        for exchange_suffix in (".NS", ".BO"):
-            if value.endswith(exchange_suffix):
-                base = value[:-len(exchange_suffix)]
-                for broker_suffix in broker_suffixes:
-                    if base.endswith(broker_suffix):
-                        base = base[:-len(broker_suffix)]
-                        break
-                return f"{base}{exchange_suffix}" if base else ""
-
-        for broker_suffix in broker_suffixes:
-            if value.endswith(broker_suffix):
-                value = value[:-len(broker_suffix)]
-                break
-
-        return f"{value}.NS" if value else ""
-
-    @classmethod
-    def _yahoo_download_symbols(
-        cls,
-        symbols: list[str],
-    ) -> list[str]:
-        """Create the final symbol list handed to yfinance.
-
-        This is intentionally the *last* normalization boundary. Every item
-        is converted again immediately before the network call, even if the
-        caller already supplied a Yahoo-formatted symbol.
-        """
-
-        result: list[str] = []
-        seen: set[str] = set()
-
-        for raw_symbol in symbols:
-            yahoo_symbol = cls._yahoo(raw_symbol)
-
-            if not yahoo_symbol:
-                continue
-
-            if yahoo_symbol in seen:
-                continue
-
-            seen.add(yahoo_symbol)
-            result.append(yahoo_symbol)
-
-        return result
-
-    @classmethod
-    def _yf_download(
-        cls,
-        symbols: str | list[str],
-        **kwargs: Any,
-    ) -> Any:
-        """Call yfinance only after a final broker-symbol sanitization pass.
-
-        This wrapper is the only yfinance download boundary in this module.
-        It deliberately accepts raw ASTRA/Angel One symbols and normalizes
-        them itself, making ``*-EQ`` leakage into yfinance impossible.
-        """
-
-        raw_symbols = [symbols] if isinstance(symbols, str) else list(symbols)
-        yahoo_symbols = cls._yahoo_download_symbols(raw_symbols)
-
-        if not yahoo_symbols:
-            return None
-
-        final_symbols: str | list[str]
-        if len(yahoo_symbols) == 1 and isinstance(symbols, str):
-            final_symbols = yahoo_symbols[0]
-        else:
-            final_symbols = yahoo_symbols
-
-        # Diagnostic assertion: this is intentionally before the network call.
-        invalid = [
-            symbol
-            for symbol in (
-                [final_symbols]
-                if isinstance(final_symbols, str)
-                else final_symbols
-            )
-            if symbol.endswith(
-                ("-EQ", "-BE", "-BL", "-BZ", "-SM", "-ST")
-            )
-        ]
-        if invalid:
-            raise ValueError(
-                f"Unsafe broker symbols reached yfinance boundary: {invalid!r}"
-            )
-
-        logger.debug(
-            "yfinance request symbols sanitized: %s",
-            final_symbols,
-        )
-
-        return yf.download(
-            final_symbols,
-            **kwargs,
+        return to_yahoo_ticker(
+            clean_ticker_symbol(ticker)
         )
 
     # ========================================================================
@@ -2999,21 +3020,13 @@ class SmartIntradayBot:
     ) -> Any:
 
         if not symbols:
-            return None
 
-        # HARD MARKET-DATA BOUNDARY:
-        # No broker-format symbol is ever allowed to reach yfinance.
-        # This protects every caller, even if it passes raw ``*-EQ`` symbols.
-        yahoo_symbols = self._yahoo_download_symbols(
-            symbols
-        )
-
-        if not yahoo_symbols:
             return None
 
         try:
-            data = self._yf_download(
-                yahoo_symbols,
+
+            data = yf.download(
+                symbols,
                 period="5d",
                 interval="5m",
                 group_by="ticker",
@@ -3023,22 +3036,29 @@ class SmartIntradayBot:
             )
 
         except Exception:
+
             logger.warning(
                 "Intraday market-data download failed."
             )
+
             logger.debug(
                 "yfinance exception.",
                 exc_info=True,
             )
+
             return None
 
         if data is None:
+
             return None
 
         try:
+
             if data.empty:
                 return None
+
         except Exception:
+
             return None
 
         return data
@@ -3176,17 +3196,7 @@ class SmartIntradayBot:
 
         try:
 
-            # ``symbol`` has already crossed the same self-contained Yahoo
-            # normalization boundary used by the bulk downloader.
-            normalized_symbols = self._yahoo_download_symbols(
-                [symbol]
-            )
-            if not normalized_symbols:
-                return 0.0
-
-            symbol = normalized_symbols[0]
-
-            data = self._yf_download(
+            data = yf.download(
                 symbol,
                 period="1d",
                 interval="5m",

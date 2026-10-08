@@ -2026,7 +2026,7 @@ def run(
     """Run the ASTRA service until shutdown."""
     install_signal_handlers()
 
-    logger.info("\033[1;38;2;255;200;0m=== Starting ASTRA Engine (24x7) ===\033[0m")
+    logger.info("\033[1;38;2;192;192;192;0m=== Starting ASTRA Engine (24x7) ===\033[0m")
 
     global telegram_thread, sip_thread
 
