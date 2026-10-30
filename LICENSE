@@ -1,21 +1,288 @@
-MIT License
+# ASTRA — Proprietary Software License Agreement
 
-Copyright (c) 2026 Srijan Bhattacharyya
+**Software:** Autonomous System for Trading and Risk Analysis (ASTRA)  
+**License Type:** Proprietary / Closed-Source  
+**Version:** 1.0  
+**Effective Date:** [DD Month YYYY]  
+**Copyright Holder:** Srijan Bhattacharyya
+**Copyright Notice:** Copyright © 2026 Srijan Bhattacharyya. All Rights Reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+---
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+## 1. Introduction
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Autonomous System for Trading and Risk Analysis (hereafter referred to as **ASTRA**) is proprietary software developed to provide market analysis, trading research, strategy evaluation, risk analysis, portfolio monitoring, and related analytical capabilities.
+
+This agreement establishes the terms under which ASTRA and its associated components may be accessed, installed, executed, or used.
+
+ASTRA is distributed under a closed-source proprietary licensing model. No rights are granted except those explicitly stated in this agreement or separately authorized in writing by the Copyright Holder.
+
+By accessing or using ASTRA under an authorized grant, the Licensee agrees to comply with these terms.
+
+## 2. Definitions
+
+For the purposes of this agreement:
+
+**2.1. ASTRA**  
+Refers to the complete Autonomous System for Trading and Risk Analysis ecosystem, including its current and future implementations, modules, services, interfaces, and associated materials.
+
+**2.2. Software Components**  
+Includes, but is not limited to:
+
+- Source code and executable binaries.
+- Core system architecture and internal implementations.
+- Intraday Engine and Research Engine.
+- Market analysis and signal-generation modules.
+- Risk management and portfolio monitoring modules.
+- Paper trading and simulation infrastructure.
+- Backtesting and strategy optimization systems.
+- Self-training, evaluation, and validation mechanisms.
+- APIs, interfaces, dashboards, and integrations.
+- Configuration files, scripts, and supporting utilities.
+
+**2.3. Documentation**  
+Includes technical documentation, manuals, architecture diagrams, development notes, configuration references, and other materials supplied with ASTRA.
+
+**2.4. Licensee**  
+Any individual or organization explicitly authorized by the Copyright Holder to access or use ASTRA.
+
+**2.5. Derivative Works**  
+Any modification, adaptation, extension, translation, or other work derived from ASTRA or its proprietary components, to the extent protected by applicable intellectual property law.
+
+## 3. Ownership and Intellectual Property
+
+3.1. ASTRA and its original proprietary components are the exclusive intellectual property of the Copyright Holder.
+
+3.2. All rights, title, and interest in ASTRA remain with the Copyright Holder unless expressly transferred through a separate written agreement.
+
+3.3. The Copyright Holder retains ownership of the original:
+
+- Software implementations and source code.
+- System architecture and proprietary designs.
+- Algorithms and internal methodologies.
+- Research and optimization infrastructure.
+- Original documentation and technical materials.
+- Branding, names, logos, and visual identity.
+
+3.4. No provision of this agreement transfers ownership of ASTRA to the Licensee.
+
+3.5. Third-party software, libraries, datasets, and other externally licensed materials remain subject to their respective ownership and licensing terms.
+
+## 4. License Grant
+
+4.1. ASTRA is licensed, not sold.
+
+4.2. The Copyright Holder may grant an individual or organization a limited, non-exclusive, non-transferable, revocable license to use ASTRA for specifically authorized purposes.
+
+4.3. The scope of the license, including permitted users, installations, environments, and duration, shall be determined by the Copyright Holder.
+
+4.4. Unless separately authorized in writing, this agreement does not grant permission to redistribute, sublicense, commercially exploit, or publicly distribute ASTRA.
+
+4.5. Access to ASTRA's source code does not, by itself, grant permission to modify, publish, or distribute it.
+
+## 5. Restrictions
+
+Unless expressly authorized in writing by the Copyright Holder, the Licensee shall not:
+
+1. Copy, reproduce, publish, or redistribute ASTRA or its proprietary components.
+2. Sell, rent, lease, sublicense, or commercially distribute ASTRA.
+3. Modify, adapt, reverse engineer, decompile, or disassemble ASTRA, except where such restriction is prohibited by applicable law.
+4. Remove or alter copyright notices, ownership declarations, or proprietary markings.
+5. Make ASTRA's source code or internal implementation publicly accessible.
+6. Use ASTRA's proprietary components to develop or distribute an unauthorized derivative product.
+7. Misrepresent ownership of ASTRA or its proprietary components.
+8. Circumvent technical access restrictions or licensing mechanisms.
+9. Disclose confidential source code, architecture, or internal technical information to unauthorized parties.
+
+Nothing in this section prohibits activities that cannot legally be restricted under applicable law.
+
+## 6. ASTRA's Intended Operational Architecture
+
+ASTRA is designed as an analytical and advisory system.
+
+Its intended architecture includes the following capabilities:
+
+### 6.1. Intraday Engine
+
+The Intraday Engine is responsible for:
+
+- Market data collection and processing.
+- Technical and quantitative market analysis.
+- Trading signal generation.
+- Risk assessment and position management.
+- Paper trading and simulated execution.
+- Market and portfolio telemetry.
+- Monitoring of trading performance.
+
+### 6.2. Research Engine
+
+The Research Engine is responsible for:
+
+- Evaluating historical and simulated trading performance.
+- Identifying weaknesses in existing strategies.
+- Conducting backtests and controlled experiments.
+- Optimizing strategy parameters.
+- Performing out-of-sample and walk-forward validation.
+- Maintaining strategy versions and experiment histories.
+- Producing recommendations for strategy improvements.
+
+### 6.3. Human-in-the-Loop Principle
+
+ASTRA is designed to provide analytical findings, recommendations, and strategy proposals.
+
+Strategy promotion and changes to active trading configurations shall remain subject to appropriate human authorization.
+
+The Research Engine is not intended to independently authorize unrestricted strategy changes or autonomously execute real-money trades.
+
+Paper trading and live financial transactions are distinct operational activities.
+
+The existence of analytical, simulation, or broker-connectivity components does not constitute authorization for autonomous live order execution.
+
+## 7. Financial and Trading Disclaimer
+
+7.1. ASTRA is a software system intended for market analysis, research, experimentation, and trading-related decision support.
+
+7.2. ASTRA does not guarantee:
+
+- Profitable trading strategies.
+- Positive investment returns.
+- Accurate market predictions.
+- Protection against financial losses.
+- Continuous availability or correctness of market data.
+- Successful execution of any proposed trading strategy.
+
+7.3. All financial markets involve risk. Historical performance, backtesting results, simulated performance, and research findings do not guarantee future results.
+
+7.4. Signals, forecasts, recommendations, and analytical outputs generated by ASTRA must not be treated as guaranteed financial outcomes.
+
+7.5. The Licensee remains responsible for independently evaluating trading decisions and complying with applicable financial, regulatory, and legal requirements.
+
+7.6. The Copyright Holder does not act as the Licensee's broker, financial adviser, investment adviser, or fiduciary merely by providing ASTRA.
+
+7.7. ASTRA's outputs may contain errors arising from software defects, inaccurate data, unexpected market conditions, or limitations in analytical models.
+
+## 8. Research Data and Generated Outputs
+
+8.1. ASTRA may generate analytical reports, trading signals, strategy configurations, backtesting results, telemetry, and other research outputs.
+
+8.2. Ownership of such outputs shall be determined by applicable law, the origin of the underlying data, third-party rights, and any separate agreements governing their generation or use.
+
+8.3. Nothing in this agreement transfers ownership of third-party market data, broker information, or externally licensed datasets to the Copyright Holder or Licensee.
+
+8.4. Access to ASTRA's Research Engine does not automatically grant access to its internal source code, proprietary algorithms, or confidential research infrastructure.
+
+## 9. Confidentiality
+
+9.1. Source code, unpublished architecture, internal algorithms, development materials, credentials, and other non-public proprietary information relating to ASTRA shall be treated as confidential when disclosed under circumstances establishing a duty of confidence.
+
+9.2. A Licensee receiving confidential information shall not disclose it to unauthorized parties.
+
+9.3. Confidentiality obligations do not apply to information that the recipient can demonstrate:
+
+- Became publicly available without breach of an obligation.
+- Was lawfully known before disclosure.
+- Was independently developed without use of confidential information.
+- Was lawfully obtained from a third party without confidentiality restrictions.
+- Must be disclosed under applicable law or a valid legal order, subject to lawful notice requirements.
+
+## 10. Third-Party Components
+
+10.1. ASTRA may incorporate open-source libraries, external APIs, third-party frameworks, datasets, and other externally developed components.
+
+10.2. Such components remain governed by their respective licenses and terms of service.
+
+10.3. This proprietary license does not supersede, replace, or remove third-party licensing obligations.
+
+10.4. The Copyright Holder shall identify applicable third-party notices where required by the relevant licenses.
+
+10.5. The Licensee is responsible for complying with applicable third-party terms when using separately obtained services or resources.
+
+## 11. Warranty Disclaimer
+
+11.1. ASTRA is provided on an **"AS IS"** and **"AS AVAILABLE"** basis, to the maximum extent permitted by applicable law.
+
+11.2. The Copyright Holder makes no express or implied warranties regarding:
+
+- Merchantability.
+- Fitness for a particular purpose.
+- Accuracy or reliability of analytical results.
+- Uninterrupted or error-free operation.
+- Compatibility with every operating environment.
+- Suitability for any particular financial activity.
+
+11.3. The Copyright Holder does not guarantee that defects, vulnerabilities, or operational failures will always be identified or corrected.
+
+## 12. Limitation of Liability
+
+12.1. To the maximum extent permitted by applicable law, the Copyright Holder shall not be liable for indirect, incidental, special, exemplary, or consequential damages arising from the use or inability to use ASTRA.
+
+12.2. This includes, where legally permissible:
+
+- Trading and investment losses.
+- Loss of expected profits.
+- Loss of data.
+- Business interruption.
+- Operational failures.
+- Losses resulting from inaccurate or delayed market data.
+- Losses resulting from decisions based on ASTRA's analytical outputs.
+
+12.3. Nothing in this agreement excludes or limits liability that cannot legally be excluded or limited under applicable law, including liability arising from fraud or wilful misconduct where such limitation is prohibited.
+
+## 13. Termination
+
+13.1. The Copyright Holder may terminate an authorization to use ASTRA if the Licensee materially breaches this agreement.
+
+13.2. Upon termination, the Licensee shall:
+
+- Stop using the licensed ASTRA components.
+- Stop distributing or providing access to ASTRA.
+- Delete or return confidential proprietary materials as reasonably instructed, subject to applicable legal retention requirements.
+- Remove unauthorized copies under their control, where legally permissible.
+
+13.3. Termination does not transfer or extinguish intellectual property ownership.
+
+13.4. Sections relating to ownership, confidentiality, disclaimers, limitations of liability, and other provisions intended to survive termination shall continue to apply to the extent permitted by law.
+
+## 14. Amendments
+
+14.1. The Copyright Holder may publish updated versions of this license.
+
+14.2. Updated terms shall apply to future distributions or uses only as specified in the applicable authorization or agreement.
+
+14.3. No amendment shall retroactively remove rights already granted under a separate binding agreement unless the parties agree otherwise or applicable law permits it.
+
+## 15. Governing Law and Jurisdiction
+
+15.1. This agreement shall be governed by the laws of **[Insert Applicable Jurisdiction]**.
+
+15.2. Disputes arising from this agreement shall be subject to the jurisdiction of the competent courts of **[Insert Applicable Court Location]**, subject to applicable law.
+
+## 16. Severability
+
+If any provision of this agreement is found invalid, unlawful, or unenforceable, the remaining provisions shall remain effective to the maximum extent permitted by law.
+
+## 17. Entire Agreement
+
+This agreement constitutes the licensing terms for ASTRA unless superseded or supplemented by a separate written agreement signed or otherwise validly accepted by the relevant parties.
+
+Any special permission, commercial arrangement, source-code access authorization, or transfer of intellectual property must be documented separately.
+
+---
+
+## Copyright and Proprietary Notice
+
+**AUTONOMOUS SYSTEM FOR TRADING AND RISK ANALYSIS (ASTRA)**
+
+Copyright © [Year] [Owner's Full Legal Name].
+
+All Rights Reserved.
+
+ASTRA is proprietary, closed-source software. Unauthorized reproduction, redistribution, modification, publication, or commercial exploitation is prohibited except where expressly authorized by the Copyright Holder or permitted by applicable law.
+
+**License:** Proprietary — All Rights Reserved  
+**Source Code Availability:** Restricted  
+**Redistribution:** Prohibited without written authorization  
+**Commercial Use:** Requires explicit authorization  
+**Derivative Works:** Restricted without written authorization
+
+*This document is a proposed proprietary software license and is not a substitute for legal advice. It should be reviewed by a qualified intellectual-property lawyer before being used as a binding agreement.*
