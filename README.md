@@ -1569,4 +1569,10 @@ Also check:
 
 ## License
 
-Add the project's applicable license information here if/when a formal license is selected.
+ASTRA (Autonomous System for Trading and Risk Analysis) is proprietary, closed-source software.
+
+Copyright © 2026 Srijan Bhattacharyya. All Rights Reserved.
+
+Unauthorized copying, modification, distribution, or commercial use is prohibited.
+
+See [LICENSE](./LICENSE) for the complete licensing terms.
