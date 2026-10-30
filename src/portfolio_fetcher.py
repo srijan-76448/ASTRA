@@ -25,11 +25,6 @@ where historical information must be preserved, particularly for:
     - Wallet_and_Holdings
     - SIP_Decisions
 
-Configuration architecture:
-    - settings.json -> non-secret runtime Google Sheets behavior.
-    - .env / caller -> Google service-account credentials and spreadsheet ID.
-    - This module never copies secrets into settings.json.
-
 Author:
     ASTRA Project
 
@@ -48,78 +43,15 @@ from typing import Any, Dict, List, Optional
 import gspread
 from google.oauth2.service_account import Credentials
 
-from utils import get_setting
-
 
 logger = logging.getLogger("ASTRA_PORTFOLIO_FETCHER")
 
 
-# ============================================================================
-# RUNTIME CONFIGURATION
-# ============================================================================
-#
-# Google service-account credentials and the spreadsheet ID are infrastructure
-# values and therefore remain outside settings.json.
-#
-# Non-secret dashboard behavior, such as worksheet names, may be overridden
-# through settings.json.
-#
-# Missing settings intentionally fall back to the existing ASTRA worksheet
-# names so this module remains backward compatible.
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-DEFAULT_MAIN_TAB = "Market Scan"
-DEFAULT_RAW_TAB = "Raw Data"
-DEFAULT_WALLET_TAB = "Wallet_and_Holdings"
-DEFAULT_SIP_TAB = "SIP"
-DEFAULT_SIP_DECISIONS_TAB = "SIP_Decisions"
-
-
-def _setting_str(path: str, default: str) -> str:
-    """
-    Read a non-secret string setting with a safe fallback.
-    """
-
-    value = get_setting(
-        path,
-        default,
-    )
-
-    if value is None:
-        return default
-
-    value = str(value).strip()
-
-    return value or default
-
-
-def _resolve_tab_name(
-    path: str,
-    supplied: Optional[str],
-    default: str,
-) -> str:
-    """
-    Resolve a worksheet name.
-
-    Explicit function arguments take priority over settings.json.
-    """
-
-    if supplied is not None and str(supplied).strip():
-        return str(supplied).strip()
-
-    return _setting_str(
-        path,
-        default,
-    )
-
-
-# ============================================================================
-# INTERNAL HELPERS
-# ============================================================================
-
-def _serialize_sheet_value(
-    value: Any,
-) -> Any:
+def _serialize_sheet_value(value: Any) -> Any:
     """
     Convert Python/SIP-engine values into Google-Sheets-safe values.
 
@@ -131,133 +63,82 @@ def _serialize_sheet_value(
         - dict/list/tuple/set
         - primitive values
     """
-
     if value is None:
         return ""
 
     if isinstance(value, Enum):
         return value.value
 
-    if isinstance(
-        value,
-        (
-            dt.datetime,
-            dt.date,
-            dt.time,
-        ),
-    ):
+    if isinstance(value, (dt.datetime, dt.date, dt.time)):
         return value.isoformat()
 
     if is_dataclass(value):
-        return _serialize_sheet_value(
-            asdict(value)
-        )
+        return _serialize_sheet_value(asdict(value))
 
     if isinstance(value, dict):
         try:
             return json.dumps(
                 {
-                    str(key): _serialize_sheet_value(
-                        item
-                    )
-                    for key, item in value.items()
+                    str(k): _serialize_sheet_value(v)
+                    for k, v in value.items()
                 },
                 ensure_ascii=False,
                 default=str,
             )
-
         except Exception:
             return str(value)
 
-    if isinstance(
-        value,
-        (
-            list,
-            tuple,
-            set,
-        ),
-    ):
+    if isinstance(value, (list, tuple, set)):
         try:
             return ", ".join(
-                str(
-                    _serialize_sheet_value(
-                        item
-                    )
-                )
+                str(_serialize_sheet_value(item))
                 for item in value
             )
-
         except Exception:
             return str(value)
 
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
 
-    if isinstance(
-        value,
-        (
-            str,
-            int,
-            float,
-        ),
-    ):
+    if isinstance(value, (str, int, float)):
         return value
 
     return str(value)
 
 
-def _normalize_records(
-    records: Optional[list],
-) -> List[Dict[str, Any]]:
+def _normalize_records(records: Optional[list]) -> List[Dict[str, Any]]:
     """
     Normalize a collection of dictionaries/dataclasses into dictionaries.
 
     This keeps the Google Sheets layer independent from the exact internal
     SIP engine representation.
     """
-
     if not records:
         return []
 
     normalized = []
 
     for record in records:
-
         try:
-
             if is_dataclass(record):
                 record = asdict(record)
 
-            elif (
-                hasattr(
-                    record,
-                    "to_dict",
-                )
-                and callable(record.to_dict)
-            ):
+            elif hasattr(record, "to_dict") and callable(record.to_dict):
                 record = record.to_dict()
 
-            elif not isinstance(
-                record,
-                dict,
-            ):
+            elif not isinstance(record, dict):
                 record = vars(record)
 
-            if not isinstance(
-                record,
-                dict,
-            ):
+            if not isinstance(record, dict):
                 logger.warning(
                     "Skipping unsupported sheet record type: %s",
                     type(record).__name__,
                 )
-
                 continue
 
             normalized.append(record)
 
         except Exception as exc:
-
             logger.warning(
                 "Could not normalize sheet record: %s",
                 exc,
@@ -276,42 +157,30 @@ def _records_to_rows(
     preferred_headers are used first, followed by any additional fields
     encountered in the records.
     """
-
     if not records:
         return []
 
     headers: List[str] = []
 
     if preferred_headers:
-        headers.extend(
-            preferred_headers
-        )
+        headers.extend(preferred_headers)
 
     for record in records:
-
         for key in record.keys():
-
             key = str(key)
 
             if key not in headers:
                 headers.append(key)
 
-    rows: List[List[Any]] = [
-        headers
-    ]
+    rows: List[List[Any]] = [headers]
 
     for record in records:
-
         row = []
 
         for header in headers:
-
             row.append(
                 _serialize_sheet_value(
-                    record.get(
-                        header,
-                        "",
-                    )
+                    record.get(header, "")
                 )
             )
 
@@ -326,28 +195,14 @@ def _get_or_create_worksheet(
     rows: int = 100,
     cols: int = 20,
 ):
-    """
-    Return an existing worksheet or create it.
-    """
-
+    """Return an existing worksheet or create it."""
     try:
-
-        return spreadsheet.worksheet(
-            title
-        )
-
+        return spreadsheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
-
         return spreadsheet.add_worksheet(
             title=title,
-            rows=max(
-                rows,
-                1,
-            ),
-            cols=max(
-                cols,
-                1,
-            ),
+            rows=max(rows, 1),
+            cols=max(cols, 1),
         )
 
 
@@ -362,25 +217,20 @@ def _ensure_worksheet_capacity(
     gspread generally allows updates beyond the currently visible range only
     after resizing, so make the operation explicit.
     """
-
     try:
-
         if worksheet.row_count < required_rows:
-
             worksheet.resize(
                 rows=required_rows,
                 cols=worksheet.col_count,
             )
 
         if worksheet.col_count < required_cols:
-
             worksheet.resize(
                 rows=worksheet.row_count,
                 cols=required_cols,
             )
 
     except Exception as exc:
-
         logger.warning(
             "Could not resize worksheet '%s': %s",
             worksheet.title,
@@ -388,38 +238,27 @@ def _ensure_worksheet_capacity(
         )
 
 
-def _make_decision_signature(
-    row: List[Any],
-) -> str:
+def _make_decision_signature(row: List[Any]) -> str:
     """
     Create a deterministic representation of a decision row.
 
     Used to avoid repeatedly appending the exact same decision telemetry
     during repeated ASTRA cycles.
     """
-
     try:
-
         return json.dumps(
-            [
-                _serialize_sheet_value(
-                    value
-                )
-                for value in row
-            ],
+            [_serialize_sheet_value(value) for value in row],
             ensure_ascii=False,
             sort_keys=False,
             default=str,
         )
-
     except Exception:
-
         return str(row)
 
 
-# ============================================================================
-# GOOGLE SHEETS SYNCHRONIZATION
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Google Sheets synchronization
+# ---------------------------------------------------------------------------
 
 def sync_dashboard_data(
     credentials_path: str,
@@ -427,13 +266,13 @@ def sync_dashboard_data(
     processed_data: list,
     raw_data: list,
     real_portfolio: dict = None,
-    main_tab_name: Optional[str] = None,
-    raw_tab_name: Optional[str] = None,
-    wallet_tab_name: Optional[str] = None,
+    main_tab_name: str = "Market Scan",
+    raw_tab_name: str = "Raw Data",
+    wallet_tab_name: str = "Wallet_and_Holdings",
     sip_data: Optional[list] = None,
     sip_decisions: Optional[list] = None,
-    sip_tab_name: Optional[str] = None,
-    sip_decisions_tab_name: Optional[str] = None,
+    sip_tab_name: str = "SIP",
+    sip_decisions_tab_name: str = "SIP_Decisions",
 ):
     """
     Synchronize ASTRA dashboard data into Google Sheets.
@@ -460,129 +299,53 @@ def sync_dashboard_data(
     treated as a human-readable dashboard and telemetry/history layer.
     """
 
-    # ------------------------------------------------------------------------
-    # Validate Google Sheets infrastructure parameters.
-    # ------------------------------------------------------------------------
-
-    if (
-        not credentials_path
-        or not os.path.exists(
-            credentials_path
-        )
-    ):
+    if not credentials_path or not os.path.exists(credentials_path):
         logger.error(
             "Credentials file missing: %s",
             credentials_path,
         )
-
         return
 
     if not spreadsheet_id:
-
-        logger.error(
-            "Spreadsheet ID missing."
-        )
-
+        logger.error("Spreadsheet ID missing.")
         return
-
-    # ------------------------------------------------------------------------
-    # Resolve non-secret worksheet names from settings.json.
-    #
-    # Explicit function arguments still win.
-    # ------------------------------------------------------------------------
-
-    main_tab_name = _resolve_tab_name(
-        "GOOGLE_SHEETS.MAIN_TAB_NAME",
-        main_tab_name,
-        DEFAULT_MAIN_TAB,
-    )
-
-    raw_tab_name = _resolve_tab_name(
-        "GOOGLE_SHEETS.RAW_TAB_NAME",
-        raw_tab_name,
-        DEFAULT_RAW_TAB,
-    )
-
-    wallet_tab_name = _resolve_tab_name(
-        "GOOGLE_SHEETS.WALLET_TAB_NAME",
-        wallet_tab_name,
-        DEFAULT_WALLET_TAB,
-    )
-
-    sip_tab_name = _resolve_tab_name(
-        "GOOGLE_SHEETS.SIP_TAB_NAME",
-        sip_tab_name,
-        DEFAULT_SIP_TAB,
-    )
-
-    sip_decisions_tab_name = _resolve_tab_name(
-        "GOOGLE_SHEETS.SIP_DECISIONS_TAB_NAME",
-        sip_decisions_tab_name,
-        DEFAULT_SIP_DECISIONS_TAB,
-    )
-
-    # ------------------------------------------------------------------------
-    # Google Sheets authentication.
-    # ------------------------------------------------------------------------
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets"
     ]
 
     try:
-
         creds = Credentials.from_service_account_file(
             credentials_path,
             scopes=scopes,
         )
 
-        client = gspread.authorize(
-            creds
-        )
-
-        sheet = client.open_by_key(
-            spreadsheet_id
-        )
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(spreadsheet_id)
 
     except Exception as exc:
-
         logger.error(
             "Failed to authorize Google Sheets API: %s",
             exc,
         )
-
         return
 
-    # ========================================================================
-    # 1. MARKET SCAN
-    # ========================================================================
+    # -----------------------------------------------------------------------
+    # 1. Market Scan
+    # -----------------------------------------------------------------------
 
-    if (
-        processed_data
-        and len(processed_data) > 1
-    ):
-
+    if processed_data and len(processed_data) > 1:
         try:
-
             worksheet = _get_or_create_worksheet(
                 sheet,
                 main_tab_name,
-                rows=max(
-                    100,
-                    len(processed_data) + 10,
-                ),
+                rows=max(100, len(processed_data) + 10),
                 cols=max(
                     10,
                     max(
                         len(row)
                         for row in processed_data
-                        if isinstance(
-                            row,
-                            (
-                                list,
-                                tuple,
-                            ),
-                        )
+                        if isinstance(row, (list, tuple))
                     ),
                 ),
             )
@@ -591,19 +354,11 @@ def sync_dashboard_data(
 
             _ensure_worksheet_capacity(
                 worksheet,
-                required_rows=len(
-                    processed_data
-                ),
+                required_rows=len(processed_data),
                 required_cols=max(
                     len(row)
                     for row in processed_data
-                    if isinstance(
-                        row,
-                        (
-                            list,
-                            tuple,
-                        ),
-                    )
+                    if isinstance(row, (list, tuple))
                 ),
             )
 
@@ -618,82 +373,60 @@ def sync_dashboard_data(
             )
 
         except Exception as exc:
-
             logger.error(
                 "Failed updating tab '%s': %s",
                 main_tab_name,
                 exc,
+                exc_info=True,
             )
+    else:
+        logger.warning(
+            "Google Sheets tab '%s' not updated: market scan contains no data rows; "
+            "preserving the existing worksheet.",
+            main_tab_name,
+        )
 
-    # ========================================================================
-    # 2. RAW DATA
-    # ========================================================================
+    # -----------------------------------------------------------------------
+    # 2. Raw Data
+    # -----------------------------------------------------------------------
 
     if raw_data:
-
         try:
-
             raw_worksheet = _get_or_create_worksheet(
                 sheet,
                 raw_tab_name,
-                rows=max(
-                    200,
-                    len(raw_data) + 10,
-                ),
+                rows=max(200, len(raw_data) + 10),
                 cols=20,
             )
 
             raw_worksheet.clear()
 
-            headers = list(
-                raw_data[0].keys()
-            )
-
-            rows = [
-                headers
-            ]
+            headers = list(raw_data[0].keys())
+            rows = [headers]
 
             for item in raw_data:
-
                 row = []
 
                 for header in headers:
+                    value = item.get(header, "")
 
-                    value = item.get(
-                        header,
-                        "",
-                    )
-
-                    if isinstance(
-                        value,
-                        list,
-                    ):
-
+                    if isinstance(value, list):
                         value = (
-                            ", ".join(
-                                str(v)
-                                for v in value
-                            )
+                            ", ".join(str(v) for v in value)
                             if value
                             else "NEUTRAL"
                         )
 
                     row.append(
-                        _serialize_sheet_value(
-                            value
-                        )
+                        _serialize_sheet_value(value)
                     )
 
                 rows.append(row)
 
             _ensure_worksheet_capacity(
                 raw_worksheet,
-                required_rows=len(
-                    rows
-                ),
-                required_cols=len(
-                    headers
-                ),
+                required_rows=len(rows),
+                required_cols=len(headers),
             )
 
             raw_worksheet.update(
@@ -708,21 +441,25 @@ def sync_dashboard_data(
             )
 
         except Exception as exc:
-
             logger.error(
                 "Failed updating tab '%s': %s",
                 raw_tab_name,
                 exc,
+                exc_info=True,
             )
+    else:
+        logger.warning(
+            "Google Sheets tab '%s' not updated: raw market dataset is empty; "
+            "preserving the existing worksheet.",
+            raw_tab_name,
+        )
 
-    # ========================================================================
-    # 3. WALLET AND HOLDINGS
-    # ========================================================================
+    # -----------------------------------------------------------------------
+    # 3. Wallet_and_Holdings
+    # -----------------------------------------------------------------------
 
     if real_portfolio is not None:
-
         try:
-
             wallet_ws = _get_or_create_worksheet(
                 sheet,
                 wallet_tab_name,
@@ -730,59 +467,43 @@ def sync_dashboard_data(
                 cols=9,
             )
 
-            # ----------------------------------------------------------------
+            # ---------------------------------------------------------------
             # Preserve existing static entries:
-            #     - Quantity
-            #     - Buy Price
+            #   - Quantity
+            #   - Buy Price
             #
             # These values are deliberately read before the sheet is cleared.
-            # ----------------------------------------------------------------
+            # ---------------------------------------------------------------
 
             existing_map = {}
 
             try:
-
-                all_vals = (
-                    wallet_ws.get_all_values()
-                )
+                all_vals = wallet_ws.get_all_values()
 
                 if len(all_vals) >= 7:
-
                     headers = [
-                        str(header)
-                        .strip()
-                        .upper()
+                        str(header).strip().upper()
                         for header in all_vals[5]
                     ]
 
                     for row in all_vals[6:]:
-
                         if not row or not row[0]:
                             continue
 
                         row_dict = {}
 
-                        for idx, header in enumerate(
-                            headers
-                        ):
-
+                        for idx, header in enumerate(headers):
                             if idx < len(row):
                                 row_dict[header] = row[idx]
 
                         ticker_key = str(
-                            row_dict.get(
-                                "TICKER",
-                                "",
-                            )
+                            row_dict.get("TICKER", "")
                         ).strip().upper()
 
                         if ticker_key:
-                            existing_map[
-                                ticker_key
-                            ] = row_dict
+                            existing_map[ticker_key] = row_dict
 
             except Exception as read_err:
-
                 logger.warning(
                     "Could not parse existing holdings to preserve "
                     "buy prices: %s",
@@ -831,89 +552,46 @@ def sync_dashboard_data(
             ]
 
             if holdings:
-
                 start_row = 7
 
                 for idx, holding in enumerate(
                     holdings,
                     start=start_row,
                 ):
-
                     ticker = str(
-                        holding.get(
-                            "ticker",
-                            "",
-                        )
+                        holding.get("ticker", "")
                     ).strip().upper()
 
                     try:
-
                         curr_price = float(
                             holding.get(
                                 "current_price",
                                 0.0,
                             )
                         )
-
-                    except (
-                        TypeError,
-                        ValueError,
-                    ):
-
+                    except (TypeError, ValueError):
                         curr_price = 0.0
 
-                    # --------------------------------------------------------
-                    # Preserve manually recorded quantity and buy price when
-                    # the ticker already exists in the dashboard.
-                    # --------------------------------------------------------
-
                     if ticker in existing_map:
-
-                        previous = existing_map[
-                            ticker
-                        ]
+                        previous = existing_map[ticker]
 
                         try:
-
                             qty = float(
                                 str(
                                     previous.get(
                                         "QUANTITY",
-                                        holding.get(
-                                            "qty",
-                                            1,
-                                        ),
+                                        holding.get("qty", 1),
                                     )
                                 )
-                                .replace(
-                                    ",",
-                                    "",
-                                )
+                                .replace(",", "")
                                 .strip()
                             )
-
-                        except (
-                            TypeError,
-                            ValueError,
-                        ):
-
-                            try:
-                                qty = float(
-                                    holding.get(
-                                        "qty",
-                                        1,
-                                    )
-                                )
-
-                            except (
-                                TypeError,
-                                ValueError,
-                            ):
-
-                                qty = 1.0
+                        except (TypeError, ValueError):
+                            qty = float(
+                                holding.get("qty", 1)
+                            )
 
                         try:
-
                             avg_price = float(
                                 str(
                                     previous.get(
@@ -924,58 +602,11 @@ def sync_dashboard_data(
                                         ),
                                     )
                                 )
-                                .replace(
-                                    "₹",
-                                    "",
-                                )
-                                .replace(
-                                    ",",
-                                    "",
-                                )
+                                .replace("₹", "")
+                                .replace(",", "")
                                 .strip()
                             )
-
-                        except (
-                            TypeError,
-                            ValueError,
-                        ):
-
-                            try:
-
-                                avg_price = float(
-                                    holding.get(
-                                        "avg_price",
-                                        curr_price,
-                                    )
-                                )
-
-                            except (
-                                TypeError,
-                                ValueError,
-                            ):
-
-                                avg_price = curr_price
-
-                    else:
-
-                        try:
-
-                            qty = float(
-                                holding.get(
-                                    "qty",
-                                    1,
-                                )
-                            )
-
-                        except (
-                            TypeError,
-                            ValueError,
-                        ):
-
-                            qty = 1.0
-
-                        try:
-
+                        except (TypeError, ValueError):
                             avg_price = float(
                                 holding.get(
                                     "avg_price",
@@ -983,16 +614,30 @@ def sync_dashboard_data(
                                 )
                             )
 
-                        except (
-                            TypeError,
-                            ValueError,
-                        ):
+                    else:
+                        try:
+                            qty = float(
+                                holding.get(
+                                    "qty",
+                                    1,
+                                )
+                            )
+                        except (TypeError, ValueError):
+                            qty = 1.0
 
+                        try:
+                            avg_price = float(
+                                holding.get(
+                                    "avg_price",
+                                    curr_price,
+                                )
+                            )
+                        except (TypeError, ValueError):
                             avg_price = curr_price
 
-                    # --------------------------------------------------------
-                    # Google Sheets formulas.
-                    # --------------------------------------------------------
+                    # -------------------------------------------------------
+                    # Google Sheets formulas
+                    # -------------------------------------------------------
 
                     invested_formula = (
                         f"=B{idx}*C{idx}"
@@ -1025,7 +670,6 @@ def sync_dashboard_data(
                     )
 
             else:
-
                 wallet_rows.append(
                     [
                         "No active holdings in Angel One account.",
@@ -1041,9 +685,7 @@ def sync_dashboard_data(
 
             _ensure_worksheet_capacity(
                 wallet_ws,
-                required_rows=len(
-                    wallet_rows
-                ),
+                required_rows=len(wallet_rows),
                 required_cols=8,
             )
 
@@ -1059,21 +701,25 @@ def sync_dashboard_data(
             )
 
         except Exception as exc:
-
             logger.error(
                 "Failed updating tab '%s': %s",
                 wallet_tab_name,
                 exc,
             )
 
-    # ========================================================================
-    # 4. SIP CURRENT STATE
-    # ========================================================================
+    else:
+        logger.warning(
+            "Google Sheets tab '%s' not updated because broker wallet state is unknown; "
+            "preserving existing values.",
+            wallet_tab_name,
+        )
+
+    # -----------------------------------------------------------------------
+    # 4. SIP
+    # -----------------------------------------------------------------------
 
     if sip_data is not None:
-
         try:
-
             sip_records = _normalize_records(
                 sip_data
             )
@@ -1081,20 +727,15 @@ def sync_dashboard_data(
             sip_ws = _get_or_create_worksheet(
                 sheet,
                 sip_tab_name,
-                rows=max(
-                    100,
-                    len(sip_records) + 10,
-                ),
+                rows=max(100, len(sip_records) + 10),
                 cols=20,
             )
 
             # SIP is a CURRENT STATE dashboard.
             # Unlike SIP_Decisions, it is intentionally refreshed.
-
             sip_ws.clear()
 
             if sip_records:
-
                 preferred_headers = [
                     "target_id",
                     "asset",
@@ -1121,7 +762,6 @@ def sync_dashboard_data(
                 )
 
             else:
-
                 sip_rows = [
                     [
                         "target_id",
@@ -1155,9 +795,7 @@ def sync_dashboard_data(
 
             _ensure_worksheet_capacity(
                 sip_ws,
-                required_rows=len(
-                    sip_rows
-                ),
+                required_rows=len(sip_rows),
                 required_cols=max(
                     len(row)
                     for row in sip_rows
@@ -1177,34 +815,27 @@ def sync_dashboard_data(
             )
 
         except Exception as exc:
-
             logger.error(
                 "Failed updating SIP tab '%s': %s",
                 sip_tab_name,
                 exc,
             )
 
-    # ========================================================================
-    # 5. SIP DECISION HISTORY
-    # ========================================================================
+    # -----------------------------------------------------------------------
+    # 5. SIP_Decisions
+    # -----------------------------------------------------------------------
 
     if sip_decisions:
-
         try:
-
             decision_records = _normalize_records(
                 sip_decisions
             )
 
             if decision_records:
-
                 decision_ws = _get_or_create_worksheet(
                     sheet,
                     sip_decisions_tab_name,
-                    rows=max(
-                        200,
-                        len(decision_records) + 20,
-                    ),
+                    rows=max(200, len(decision_records) + 20),
                     cols=30,
                 )
 
@@ -1236,23 +867,20 @@ def sync_dashboard_data(
                     preferred_headers=preferred_headers,
                 )
 
-                # ------------------------------------------------------------
+                # -----------------------------------------------------------
                 # SIP_Decisions is APPEND-ONLY.
                 #
-                # Existing decision history is retained.
-                # Exact duplicate rows are ignored.
-                # ------------------------------------------------------------
+                # We retain existing decision history instead of clearing
+                # the worksheet. Exact duplicate rows are skipped.
+                # -----------------------------------------------------------
 
                 existing_values = []
 
                 try:
-
                     existing_values = (
                         decision_ws.get_all_values()
                     )
-
                 except Exception as read_err:
-
                     logger.warning(
                         "Could not read existing SIP decision "
                         "history: %s",
@@ -1260,15 +888,10 @@ def sync_dashboard_data(
                     )
 
                 if not existing_values:
-
                     _ensure_worksheet_capacity(
                         decision_ws,
-                        required_rows=len(
-                            new_rows
-                        ),
-                        required_cols=len(
-                            new_rows[0]
-                        ),
+                        required_rows=len(new_rows),
+                        required_cols=len(new_rows[0]),
                     )
 
                     decision_ws.update(
@@ -1283,13 +906,10 @@ def sync_dashboard_data(
                     )
 
                 else:
-
                     existing_signatures = set()
 
-                    # Existing header is not part of duplicate checking.
-
+                    # Existing header is not part of the duplicate check.
                     for existing_row in existing_values[1:]:
-
                         existing_signatures.add(
                             _make_decision_signature(
                                 existing_row
@@ -1299,26 +919,17 @@ def sync_dashboard_data(
                     rows_to_append = []
 
                     for row in new_rows[1:]:
-
-                        signature = (
-                            _make_decision_signature(
-                                row
-                            )
+                        signature = _make_decision_signature(
+                            row
                         )
 
                         if signature in existing_signatures:
                             continue
 
-                        existing_signatures.add(
-                            signature
-                        )
-
-                        rows_to_append.append(
-                            row
-                        )
+                        existing_signatures.add(signature)
+                        rows_to_append.append(row)
 
                     if rows_to_append:
-
                         _ensure_worksheet_capacity(
                             decision_ws,
                             required_rows=(
@@ -1343,14 +954,12 @@ def sync_dashboard_data(
                         )
 
                     else:
-
                         logger.info(
                             "No new SIP decisions to append to '%s'.",
                             sip_decisions_tab_name,
                         )
 
         except Exception as exc:
-
             logger.error(
                 "Failed updating SIP decision tab '%s': %s",
                 sip_decisions_tab_name,
@@ -1358,15 +967,16 @@ def sync_dashboard_data(
             )
 
 
-# ============================================================================
-# COST-PRICE LOOKUP
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Cost-price lookup
+# ---------------------------------------------------------------------------
 
+    logger.info("Google Sheets synchronization routine finished; check per-tab logs above for updated or preserved worksheets.")
 def get_cost_price_from_sheet(
     credentials_path: str,
     spreadsheet_id: str,
     ticker: str,
-    tab_name: str = DEFAULT_WALLET_TAB,
+    tab_name: str = "Wallet_and_Holdings",
 ) -> float:
     """
     Read the designated Google Sheets tab and return the recorded cost
@@ -1378,19 +988,6 @@ def get_cost_price_from_sheet(
     """
 
     try:
-
-        # When the caller uses the normal Wallet_and_Holdings default,
-        # allow settings.json to override the actual worksheet name.
-        if (
-            not tab_name
-            or tab_name == DEFAULT_WALLET_TAB
-        ):
-
-            tab_name = _setting_str(
-                "GOOGLE_SHEETS.WALLET_TAB_NAME",
-                DEFAULT_WALLET_TAB,
-            )
-
         gc = gspread.service_account(
             filename=credentials_path
         )
@@ -1410,7 +1007,6 @@ def get_cost_price_from_sheet(
         )
 
         for row in records:
-
             row_ticker = str(
                 row.get(
                     "TICKER",
@@ -1425,42 +1021,21 @@ def get_cost_price_from_sheet(
                 continue
 
             value = (
-                row.get(
-                    "BUY PRICE (INR)"
-                )
-                or row.get(
-                    "Cost Price"
-                )
-                or row.get(
-                    "Buy Price"
-                )
-                or row.get(
-                    "Avg Price"
-                )
+                row.get("BUY PRICE (INR)")
+                or row.get("Cost Price")
+                or row.get("Buy Price")
+                or row.get("Avg Price")
             )
 
             if value:
-
                 try:
-
                     return float(
                         str(value)
-                        .replace(
-                            "₹",
-                            "",
-                        )
-                        .replace(
-                            ",",
-                            "",
-                        )
+                        .replace("₹", "")
+                        .replace(",", "")
                         .strip()
                     )
-
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-
+                except (TypeError, ValueError):
                     logger.warning(
                         "Invalid cost price '%s' for %s.",
                         value,
@@ -1468,7 +1043,6 @@ def get_cost_price_from_sheet(
                     )
 
     except Exception as exc:
-
         logger.error(
             "Error fetching cost price from Google Sheet "
             "for %s: %s",

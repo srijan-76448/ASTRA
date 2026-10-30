@@ -673,6 +673,20 @@ async def cmd_help(
 # /intraday
 # ======================================================================
 
+def _configured_intraday_mode() -> str:
+    """Return the validated settings.json mode; invalid values fail closed."""
+    try:
+        raw_mode = str(get_setting("INTRADAY.mode", "advisory")).strip().lower()
+    except Exception:
+        logger.warning("Unable to read INTRADAY.mode; defaulting to advisory.", exc_info=True)
+        return "advisory"
+
+    if raw_mode not in {"advisory", "trader"}:
+        logger.warning("Invalid INTRADAY.mode=%r; defaulting to advisory.", raw_mode)
+        return "advisory"
+    return raw_mode
+
+
 async def cmd_intraday(
     update,
     context,
@@ -685,6 +699,18 @@ async def cmd_intraday(
         return
 
     global INTRADAY_ENGINE
+
+    configured_mode = _configured_intraday_mode()
+    if configured_mode == "trader":
+        await update.message.reply_text(
+            "⛔ <b>Smart Intraday activation blocked.</b>\n\n"
+            "<code>INTRADAY.mode</code> is set to <b>trader</b>, but ASTRA's live "
+            "order-execution gateway is not implemented and verified.\n"
+            "No order was submitted. Set <code>INTRADAY.mode</code> to "
+            "<code>advisory</code> to use the current safe mode.",
+            parse_mode="HTML",
+        )
+        return
 
     if SMART_CLIENT is None:
 
@@ -756,7 +782,9 @@ async def cmd_intraday(
             await update.message.reply_text(
                 (
                     "🟢 <b>Smart Intraday activated.</b>\n\n"
-                    "Mode: DAILY\n"
+                    "Session type: DAILY\n"
+                    "Execution mode: ADVISORY\n"
+                    f"Configured mode: {configured_mode.upper()}\n"
                     "Expiry: 15:30 IST\n"
                     "Runtime .env: unchanged\n\n"
                     f"First scan: <b>{escape(str(scan_status or 'TRIGGERED'))}</b>"
@@ -973,6 +1001,7 @@ async def cmd_start(
 
     if (
         ALWAYS_ACTIVE_INTRADAY
+        and _configured_intraday_mode() == "advisory"
         and SMART_CLIENT is not None
         and getattr(SMART_CLIENT, "is_authenticated", False)
         and _market_is_open()
@@ -1141,6 +1170,7 @@ _CONFIGURABLE_SETTINGS = (
     "NORMAL_TRADING.ENABLE_TRAILING_STOP",
     "NORMAL_TRADING.STOP_LOSS_PCT",
     "NORMAL_TRADING.TRAILING_STOP_PCT",
+    "INTRADAY.mode",
     "INTRADAY.TRADING_ENGINE",
     "INTRADAY.LIVE_TRADING",
     "INTRADAY.TICKERS_COUNT",
@@ -1221,7 +1251,11 @@ def _coerce_setting_value(path: str, raw_value: str) -> Any:
 
 
 def _set_value_is_valid(path: str, value: str) -> bool:
-    return bool(path and value.strip())
+    if not path or not value.strip():
+        return False
+    if path.lower() == "intraday.mode":
+        return value.strip().lower() in {"advisory", "trader"}
+    return True
 
 
 async def cmd_set(
@@ -1258,7 +1292,8 @@ async def cmd_set(
         await update.message.reply_text(
             "❌ Unsupported runtime setting.\n\n"
             "Use a permitted settings.json path such as "
-            "<code>mailer.time</code>.",
+            "<code>mailer.time</code>. For <code>INTRADAY.mode</code>, "
+            "allowed values are <code>advisory</code> or <code>trader</code>.",
             parse_mode="HTML",
         )
         return
@@ -1327,10 +1362,12 @@ def _get_intraday_status() -> tuple[str, str]:
     the DB is used only as a recovery/telemetry fallback.
     """
 
+    configured_mode = _configured_intraday_mode().upper()
+
     if is_module_killed("intraday"):
         return (
             "🔴 KILLED",
-            "Module killed.",
+            f"Configured mode: {escape(configured_mode)}\nModule killed.",
         )
 
     if INTRADAY_ENGINE is not None:
@@ -1349,13 +1386,15 @@ def _get_intraday_status() -> tuple[str, str]:
                         "execution_mode",
                         "ADVISORY",
                     )
+                    configured_mode = _configured_intraday_mode().upper()
 
                     if active:
                         details = (
-                            f"Mode: DAILY\n"
+                            f"Session type: DAILY\n"
+                            f"Configured mode: {escape(configured_mode)}\n"
+                            f"Engine mode: {escape(str(execution_mode))}\n"
                             f"Date: {escape(str(session_date or 'unknown'))}\n"
-                            f"Open positions: {int(snapshot.get('open_positions', 0) or 0)}\n"
-                            f"Mode: {escape(str(execution_mode))}"
+                            f"Open positions: {int(snapshot.get('open_positions', 0) or 0)}"
                         )
                         return ("🟢 ON", details)
         except Exception:
@@ -1379,7 +1418,8 @@ def _get_intraday_status() -> tuple[str, str]:
             return (
                 "🟢 ON",
                 (
-                    f"Mode: {escape(str(mode))}\n"
+                    f"Session type: {escape(str(mode))}\n"
+                    f"Configured mode: {escape(configured_mode)}\n"
                     f"Date: {escape(str(stored_date))}"
                 ),
             )
@@ -1391,6 +1431,7 @@ def _get_intraday_status() -> tuple[str, str]:
 
     return (
         "🔴 OFF",
+        f"Configured mode: {escape(configured_mode)}\n"
         "No active Smart Intraday session.",
     )
 
@@ -1659,6 +1700,10 @@ async def cmd_config(
         lines.append(f"<b>[{escape(section)}]</b>")
         values = settings.get(section, {})
         if isinstance(values, dict):
+            # Display the effective default even before INTRADAY.mode has been
+            # explicitly written to settings.json by an administrator.
+            if section == "INTRADAY" and "mode" not in values:
+                lines.append("mode: advisory")
             for key, value in values.items():
                 if isinstance(value, bool):
                     rendered = "true" if value else "false"

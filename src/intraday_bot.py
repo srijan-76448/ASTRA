@@ -6,7 +6,13 @@ Purpose
 -------
 Dedicated intraday analysis and position-management subsystem for ASTRA.
 
-This module is intentionally HUMAN-IN-THE-LOOP.
+This module supports two explicitly configured modes:
+
+    advisory: generate recommendations only; never invoke an executor.
+    trader: automatically process signals through the configured executor.
+
+The built-in executor is PaperExecutor. Real broker execution is NOT
+implemented by this module and must not be inferred from ``mode="trader"``.
 
 It can:
     - scan the intraday market universe
@@ -18,7 +24,9 @@ It can:
     - enforce capital/risk limits
     - prepare execution intents for a human/operator
 
-It does NOT autonomously submit live broker orders.
+The built-in implementation does NOT autonomously submit live broker orders.
+Trader mode currently performs paper execution only unless a separately
+reviewed executor is explicitly injected by a future integration.
 
 Ownership model
 ---------------
@@ -88,6 +96,7 @@ from decision_engine import (
     evaluate_exit_signal,
 )
 from mng_db import DatabaseManager
+from paper_trading import PaperTradingSimulator
 from tickers import get_dynamic_tickers
 from utils import get_setting, clean_ticker_symbol, to_yahoo_ticker
 
@@ -168,7 +177,23 @@ def _sheet_setting(name: str, default: str = "") -> str:
         value = None
 
     if value is None or str(value).strip() == "":
-        value = os.getenv(name.split(".")[-1], default)
+        leaf = name.split(".")[-1]
+        aliases = {
+            "SPREADSHEET_ID": (
+                "GOOGLE_SHEETS_SPREADSHEET_ID",
+                "SPREADSHEET_ID",
+                "GOOGLE_SHEET_ID",
+            ),
+            "SERVICE_ACCOUNT_FILE": (
+                "GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE",
+                "SERVICE_ACCOUNT_FILE",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+            ),
+        }.get(leaf, (leaf,))
+        value = next(
+            (os.getenv(alias) for alias in aliases if os.getenv(alias)),
+            default,
+        )
 
     return str(value or default).strip()
 
@@ -322,53 +347,71 @@ class OrderExecutor(Protocol):
         ...
 
 
+def _setting_number(path: str, default: float) -> float:
+    """Read a numeric setting and reject non-finite or negative values."""
+    try:
+        value = float(get_setting(path, default))
+        return value if math.isfinite(value) and value >= 0 else float(default)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+
+
 class PaperExecutor:
-    """
-    Non-broker execution adapter.
+    """SQLite-backed virtual executor. It never submits broker orders."""
 
-    Returns a local paper order ID.
-
-    This keeps the rest of the intraday engine testable without making
-    autonomous financial transactions.
-    """
-
-    def buy(
+    def __init__(
         self,
-        intent: TradeIntent,
-    ) -> Optional[str]:
+        db_path: str | Path | None = None,
+        simulator: Optional[PaperTradingSimulator] = None,
+    ) -> None:
+        if db_path is None:
+            project_root = Path(__file__).resolve().parents[1]
+            db_path = project_root / "data" / "astra_paper_trading.db"
 
-        order_id = (
-            f"PAPER-BUY-{intent.intent_id[:12]}"
+        db_path = Path(db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.simulator = simulator or PaperTradingSimulator(
+            db_path=db_path,
+            initial_balance=_setting_number("INTRADAY.PAPER.INITIAL_BALANCE", 100000.0),
+            slippage_bps=_setting_number("INTRADAY.PAPER.SLIPPAGE_BPS", 5.0),
+            brokerage_rate=_setting_number("INTRADAY.PAPER.BROKERAGE_RATE", 0.0003),
+            brokerage_cap_per_order=_setting_number("INTRADAY.PAPER.BROKERAGE_CAP_PER_ORDER", 20.0),
+            transaction_charge_bps=_setting_number("INTRADAY.PAPER.TRANSACTION_CHARGE_BPS", 3.5),
+            stt_sell_bps=_setting_number("INTRADAY.PAPER.STT_SELL_BPS", 2.5),
+            stamp_buy_bps=_setting_number("INTRADAY.PAPER.STAMP_BUY_BPS", 0.3),
+            gst_rate=_setting_number("INTRADAY.PAPER.GST_RATE", 0.18),
         )
 
-        logger.info(
-            "PAPER BUY | %s | qty=%s | price=%.2f | id=%s",
-            intent.ticker,
-            intent.quantity,
-            intent.price,
-            order_id,
-        )
+    def buy(self, intent: TradeIntent) -> Optional[str]:
+        return self.simulator.buy(intent)
 
-        return order_id
+    def sell(self, intent: TradeIntent) -> Optional[str]:
+        return self.simulator.sell(intent)
 
-    def sell(
-        self,
-        intent: TradeIntent,
-    ) -> Optional[str]:
+    def get_available_cash(self) -> float:
+        return self.simulator.get_available_cash()
 
-        order_id = (
-            f"PAPER-SELL-{intent.intent_id[:12]}"
-        )
+    def get_fill_price(self, order_id: str) -> Optional[float]:
+        return self.simulator.get_fill_price(order_id)
 
-        logger.info(
-            "PAPER SELL | %s | qty=%s | price=%.2f | id=%s",
-            intent.ticker,
-            intent.quantity,
-            intent.price,
-            order_id,
-        )
+    def get_order(self, order_id: str) -> Optional[dict[str, Any]]:
+        return self.simulator.get_order(order_id)
 
-        return order_id
+    def mark_price(self, ticker: str, price: float) -> bool:
+        return self.simulator.mark_price(ticker, price)
+
+    def snapshot(self) -> dict[str, Any]:
+        return self.simulator.snapshot().__dict__
+
+    def session_pnl(self, session_date: str) -> float:
+        return self.simulator.session_pnl(session_date)
+
+    def daily_loss_breached(self, max_daily_loss_fraction: float, session_date: str) -> bool:
+        return self.simulator.daily_loss_breached(max_daily_loss_fraction, session_date)
+
+    def rollback_order(self, order_id: str, reason: str = "LEDGER_SYNC_FAILED") -> bool:
+        return self.simulator.rollback_order(order_id, reason)
 
 
 # ============================================================================
@@ -471,112 +514,101 @@ class BotConfig:
 
     def __init__(self) -> None:
 
-        self.scan_interval = _env_int(
-            "INTRADAY_SCAN_INTERVAL_SECONDS",
-            180,
-            minimum=15,
-        )
+        # Mode is a runtime application setting, not an infrastructure secret.
+        # Fail closed to advisory if missing or invalid. The setting is read
+        # when the shared bot is constructed; restart ASTRA after changing it.
+        try:
+            # JSON keys are case-sensitive. Accept the documented MODE spelling
+            # and the older lowercase mode spelling for backwards compatibility.
+            configured_mode = get_setting("INTRADAY.MODE", None)
+            if configured_mode is None:
+                configured_mode = get_setting("INTRADAY.mode", "advisory")
+        except Exception:
+            configured_mode = "advisory"
 
-        self.tickers_count = _env_int(
-            "INTRADAY_TICKERS_COUNT",
-            _env_int(
-                "TICKERS_COUNT",
-                50,
-                minimum=1,
-            ),
-            minimum=1,
-        )
-
-        self.rsi_lower = _env_float(
-            "INTRADAY_RSI_LOWER_THRESHOLD",
-            _env_float(
-                "RSI_LOWER_THRESHOLD",
-                35.0,
-            ),
-        )
-
-        self.rsi_upper = _env_float(
-            "INTRADAY_RSI_UPPER_THRESHOLD",
-            _env_float(
-                "RSI_UPPER_THRESHOLD",
-                65.0,
-            ),
-        )
-
-        self.stop_loss_pct = abs(
-            _env_float(
-                "INTRADAY_STOP_LOSS_PCT",
-                0.03,
+        configured_mode = str(configured_mode or "advisory").strip().lower()
+        if configured_mode not in {"advisory", "trader"}:
+            logger.warning(
+                "Invalid INTRADAY.mode=%r; falling back to advisory mode.",
+                configured_mode,
             )
+            configured_mode = "advisory"
+
+        self.mode = configured_mode
+
+        self.scan_interval = max(15, int(_setting_number(
+            "INTRADAY.SCAN_INTERVAL_SECONDS",
+            _env_int("INTRADAY_SCAN_INTERVAL_SECONDS", 180, minimum=15),
+        )))
+
+        self.tickers_count = max(1, int(_setting_number(
+            "INTRADAY.TICKERS_COUNT",
+            _env_int("INTRADAY_TICKERS_COUNT", _env_int("TICKERS_COUNT", 50, minimum=1), minimum=1),
+        )))
+
+        self.rsi_lower = _setting_number(
+            "INTRADAY.RSI_LOWER_THRESHOLD",
+            _env_float("INTRADAY_RSI_LOWER_THRESHOLD", _env_float("RSI_LOWER_THRESHOLD", 35.0)),
         )
 
-        self.trailing_stop_pct = abs(
-            _env_float(
-                "INTRADAY_TRAILING_STOP_PCT",
-                0.02,
-            )
+        self.rsi_upper = _setting_number(
+            "INTRADAY.RSI_UPPER_THRESHOLD",
+            _env_float("INTRADAY_RSI_UPPER_THRESHOLD", _env_float("RSI_UPPER_THRESHOLD", 65.0)),
         )
 
-        self.min_alloc = max(
-            0.0,
-            _env_float(
-                "INTRADAY_MIN_ALLOCATION",
-                _env_float(
-                    "MIN_TRADE_ALLOCATION",
-                    100.0,
-                ),
-            ),
-        )
+        self.stop_loss_pct = abs(_setting_number(
+            "INTRADAY.STOP_LOSS_PCT",
+            _env_float("INTRADAY_STOP_LOSS_PCT", 0.03),
+        ))
 
-        self.max_alloc = max(
-            self.min_alloc,
-            _env_float(
-                "INTRADAY_MAX_ALLOCATION",
-                _env_float(
-                    "MAX_TRADE_ALLOCATION",
-                    500.0,
-                ),
-            ),
-        )
+        self.trailing_stop_pct = abs(_setting_number(
+            "INTRADAY.TRAILING_STOP_PCT",
+            _env_float("INTRADAY_TRAILING_STOP_PCT", 0.02),
+        ))
 
-        self.alloc_pct = max(
-            0.0,
-            _env_float(
-                "INTRADAY_PORTFOLIO_ALLOCATION_PCT",
-                _env_float(
-                    "PORTFOLIO_ALLOCATION_PCT",
-                    0.10,
-                ),
-            ),
-        )
+        self.min_alloc = max(0.0, _setting_number(
+            "INTRADAY.MIN_ALLOCATION",
+            _env_float("INTRADAY_MIN_ALLOCATION", _env_float("MIN_TRADE_ALLOCATION", 100.0)),
+        ))
 
-        self.max_positions = _env_int(
-            "INTRADAY_MAX_POSITIONS",
-            5,
-            minimum=1,
-        )
+        self.max_alloc = max(self.min_alloc, _setting_number(
+            "INTRADAY.MAX_ALLOCATION",
+            _env_float("INTRADAY_MAX_ALLOCATION", _env_float("MAX_TRADE_ALLOCATION", 500.0)),
+        ))
 
-        self.max_daily_loss = abs(
-            _env_float(
-                "INTRADAY_MAX_DAILY_LOSS",
-                0.02,
-            )
-        )
+        self.alloc_pct = max(0.0, _setting_number(
+            "INTRADAY.PORTFOLIO_ALLOCATION_PCT",
+            _env_float("INTRADAY_PORTFOLIO_ALLOCATION_PCT", _env_float("PORTFOLIO_ALLOCATION_PCT", 0.10)),
+        ))
+
+        self.max_positions = max(1, int(_setting_number(
+            "INTRADAY.MAX_POSITIONS",
+            _env_int("INTRADAY_MAX_POSITIONS", 5, minimum=1),
+        )))
+
+        self.max_daily_loss = abs(_setting_number(
+            "INTRADAY.MAX_DAILY_LOSS",
+            _env_float("INTRADAY_MAX_DAILY_LOSS", 0.02),
+        ))
 
         self.live_trading_requested = _env_bool(
             "ASTRA_INTRADAY_LIVE_TRADING",
             False,
         )
 
-        self.enable_trailing_stop = _env_bool(
-            "ENABLE_TRAILING_STOP",
-            True,
+        configured_trailing = get_setting("INTRADAY.ENABLE_TRAILING_STOP", None)
+        self.enable_trailing_stop = (
+            bool(configured_trailing) if configured_trailing is not None
+            else _env_bool("ENABLE_TRAILING_STOP", True)
         )
 
         self.force_exit_enabled = True
 
-        # This module never submits live broker orders.
-        self.execution_mode = "ADVISORY"
+        # Compatibility field consumed by existing status/Telegram callers.
+        # Trader mode is paper-only in this implementation: no live Angel One
+        # order-placement executor is supplied by this module.
+        self.execution_mode = self.mode.upper()
+        self.execution_backend = "PAPER" if self.mode == "trader" else "NONE"
 
     def summary(self) -> dict[str, Any]:
 
@@ -592,10 +624,12 @@ class BotConfig:
             "alloc_pct": self.alloc_pct,
             "max_positions": self.max_positions,
             "max_daily_loss": self.max_daily_loss,
+            "mode": self.mode,
             "live_trading_requested": (
                 self.live_trading_requested
             ),
             "execution_mode": self.execution_mode,
+            "execution_backend": self.execution_backend,
         }
 
 
@@ -1540,7 +1574,9 @@ class SmartIntradayBot:
         never directly sold by this subsystem.
 
     Execution:
-        advisory/paper only.
+        advisory mode: recommendations only, no executor calls.
+        trader mode: automatic paper execution through PaperExecutor.
+        live broker execution is not implemented in this module.
     """
 
     def __init__(
@@ -1589,7 +1625,7 @@ class SmartIntradayBot:
 
         self.executor = (
             executor
-            or PaperExecutor()
+            or PaperExecutor(db_path=self.db.db_path)
         )
 
         self._lock = (
@@ -1791,10 +1827,16 @@ class SmartIntradayBot:
         self._sync_google_sheet_holdings()
 
         logger.warning(
-            "SMART INTRADAY ACTIVATED | live=%s | date=%s",
-            self.config.live_trading_requested,
+            "SMART INTRADAY ACTIVATED | mode=%s | backend=%s | date=%s",
+            self.config.mode.upper(),
+            self.config.execution_backend,
             date_text,
         )
+        if self.config.mode == "trader":
+            logger.warning(
+                "TRADER MODE IS PAPER-ONLY: no live Angel One order executor "
+                "is configured by intraday_bot.py."
+            )
 
         return True
 
@@ -1844,42 +1886,26 @@ class SmartIntradayBot:
                     ),
                 }
 
-            wallet = self._wallet()
-
-            if wallet is None:
-
-                logger.warning(
-                    "Intraday cycle blocked: "
-                    "Angel One wallet unavailable."
-                )
-
-                return {
-                    "status": "BLOCKED",
-                    "reason": (
-                        "WALLET_UNAVAILABLE"
-                    ),
-                }
-
-            try:
-
-                cash = float(
-                    wallet[
-                        "available_cash"
-                    ]
-                )
-
-            except (
-                TypeError,
-                ValueError,
-                KeyError,
-            ):
-
-                return {
-                    "status": "BLOCKED",
-                    "reason": (
-                        "WALLET_INVALID"
-                    ),
-                }
+            if self.config.mode == "trader":
+                # Paper mode uses virtual funds; never require or read the real wallet.
+                try:
+                    cash = float(self.executor.get_available_cash())
+                    if not math.isfinite(cash) or cash < 0:
+                        raise ValueError("invalid virtual cash")
+                except Exception:
+                    logger.exception("Paper cycle blocked: virtual account unavailable.")
+                    return {"status": "BLOCKED", "reason": "PAPER_ACCOUNT_UNAVAILABLE"}
+            else:
+                wallet = self._wallet()
+                if wallet is None:
+                    logger.warning("Intraday advisory cycle blocked: Angel One wallet unavailable.")
+                    return {"status": "BLOCKED", "reason": "WALLET_UNAVAILABLE"}
+                try:
+                    cash = float(wallet["available_cash"])
+                    if not math.isfinite(cash) or cash < 0:
+                        raise ValueError("invalid wallet cash")
+                except (TypeError, ValueError, KeyError):
+                    return {"status": "BLOCKED", "reason": "WALLET_INVALID"}
 
             exits = (
                 self.manage_owned_positions()
@@ -1900,10 +1926,15 @@ class SmartIntradayBot:
                 "open_positions": len(
                     self.ledger.positions()
                 ),
-                "daily_pnl": self.daily_pnl,
-                "execution_mode": (
-                    self.config.execution_mode
+                "daily_pnl": (
+                    self.executor.session_pnl(now.date().isoformat())
+                    if self.config.mode == "trader" and callable(getattr(self.executor, "session_pnl", None))
+                    else self.daily_pnl
                 ),
+                "mode": self.config.mode,
+                "execution_mode": self.config.execution_mode,
+                "execution_backend": self.config.execution_backend,
+                "paper_account": self.executor.snapshot() if self.config.mode == "trader" and callable(getattr(self.executor, "snapshot", None)) else None,
             }
 
     # ========================================================================
@@ -2012,6 +2043,14 @@ class SmartIntradayBot:
         self,
     ) -> Optional[float]:
 
+        if self.config.mode == "trader":
+            try:
+                value = float(self.executor.get_available_cash())
+                return value if math.isfinite(value) and value >= 0 else None
+            except Exception:
+                logger.exception("Unable to read ASTRA virtual paper balance.")
+                return None
+
         wallet = self._wallet()
 
         if wallet is None:
@@ -2041,6 +2080,28 @@ class SmartIntradayBot:
 
         return value
 
+    def _execution_price(self, order_id: str, fallback: float) -> float:
+        getter = getattr(self.executor, "get_fill_price", None)
+        if callable(getter):
+            try:
+                fill = getter(order_id)
+                if fill is not None and math.isfinite(float(fill)) and float(fill) > 0:
+                    return float(fill)
+            except Exception:
+                logger.exception("Unable to read execution fill price for %s", order_id)
+        return float(fallback)
+
+    def _execution_order(self, order_id: str) -> dict[str, Any]:
+        getter = getattr(self.executor, "get_order", None)
+        if callable(getter):
+            try:
+                result = getter(order_id)
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                logger.exception("Unable to read execution order %s", order_id)
+        return {}
+
     # ========================================================================
     # ENTRY SCAN
     # ========================================================================
@@ -2055,6 +2116,23 @@ class SmartIntradayBot:
         if not self.gate.allowed():
 
             return []
+
+        if self.config.mode == "trader":
+            session_date = dt.datetime.now(IST).date().isoformat()
+            loss_check = getattr(self.executor, "daily_loss_breached", None)
+            if callable(loss_check):
+                try:
+                    if loss_check(self.config.max_daily_loss, session_date):
+                        session_pnl = getattr(self.executor, "session_pnl", lambda _day: 0.0)(session_date)
+                        logger.critical(
+                            "PAPER ENTRIES HALTED | daily loss limit reached | session_pnl=%.2f | limit_pct=%.4f",
+                            session_pnl,
+                            self.config.max_daily_loss,
+                        )
+                        return []
+                except Exception:
+                    logger.exception("Unable to verify paper daily-loss limit; blocking new entries.")
+                    return []
 
         if cash < 0:
 
@@ -2295,14 +2373,38 @@ class SmartIntradayBot:
                     continue
 
                 # ---------------------------------------------------------
-                # PAPER / ADVISORY ACTION
+                # ADVISORY MODE: RECOMMEND ONLY
                 # ---------------------------------------------------------
 
-                order_id = (
-                    self.executor.buy(
-                        intent
+                if self.config.mode == "advisory":
+                    recommendation = {
+                        "ticker": broker_symbol,
+                        "action": "BUY_RECOMMENDATION",
+                        "quantity": quantity,
+                        "price": price,
+                        "stop_loss": stop_loss,
+                        "trailing_stop": trailing_stop,
+                        "reason": reason,
+                        "risk": decision.reason,
+                        "mode": "advisory",
+                    }
+                    logger.info(
+                        "ADVISORY BUY | %s | qty=%s | price=%.2f | SL=%.2f | TSL=%.2f | %s",
+                        broker_symbol,
+                        quantity,
+                        price,
+                        stop_loss,
+                        trailing_stop,
+                        reason,
                     )
-                )
+                    results.append(recommendation)
+                    continue
+
+                # ---------------------------------------------------------
+                # TRADER MODE: BUILT-IN EXECUTOR IS PAPER-ONLY
+                # ---------------------------------------------------------
+
+                order_id = self.executor.buy(intent)
 
                 if not order_id:
 
@@ -2319,67 +2421,55 @@ class SmartIntradayBot:
 
                     continue
 
-                position = (
-                    IntradayPosition(
-                        ticker=broker_symbol,
-                        quantity=quantity,
-                        entry_price=price,
-                        current_price=price,
-                        stop_loss=stop_loss,
-                        trailing_stop=trailing_stop,
-                        peak_price=price,
-                        session_date=session_date,
-                        entry_order_id=order_id,
-                    )
+                fill_price = self._execution_price(order_id, price)
+                fill_stop_loss = fill_price * (1 - self.config.stop_loss_pct)
+                fill_trailing_stop = fill_price * (1 - self.config.trailing_stop_pct)
+                position = IntradayPosition(
+                    ticker=broker_symbol,
+                    quantity=quantity,
+                    entry_price=fill_price,
+                    current_price=price,
+                    stop_loss=fill_stop_loss,
+                    trailing_stop=fill_trailing_stop,
+                    peak_price=price,
+                    session_date=session_date,
+                    entry_order_id=order_id,
                 )
 
-                if not self.ledger.record_entry(
-                    position
-                ):
-
-                    logger.error(
-                        "Intraday signal generated for %s "
-                        "but ledger persistence failed.",
-                        broker_symbol,
-                    )
-
-                    results.append(
-                        {
-                            "ticker": broker_symbol,
-                            "action": "BUY_SIGNAL",
-                            "quantity": quantity,
-                            "price": price,
-                            "reason": reason,
-                            "ledger": "PERSISTENCE_FAILED",
-                        }
-                    )
-
+                if not self.ledger.record_entry(position):
+                    rollback = getattr(self.executor, "rollback_order", None)
+                    rolled_back = bool(rollback(order_id, "INTRADAY_LEDGER_ENTRY_FAILED")) if callable(rollback) else False
+                    logger.error("Paper BUY ledger persistence failed for %s; simulator rollback=%s", broker_symbol, rolled_back)
+                    results.append({
+                        "ticker": broker_symbol, "action": "BUY_REJECTED", "quantity": quantity,
+                        "reference_price": price, "fill_price": fill_price,
+                        "reason": "LEDGER_PERSISTENCE_FAILED", "simulator_rollback": rolled_back,
+                    })
                     continue
 
                 self.ledger.record_trade(
                     ticker=broker_symbol,
                     action="BUY",
                     quantity=quantity,
-                    price=price,
+                    price=fill_price,
                     order_id=order_id,
                     reason=reason,
                     status="PAPER",
                     session_date=session_date,
                 )
-
-                results.append(
-                    {
-                        "ticker": broker_symbol,
-                        "action": "BUY_SIGNAL",
-                        "quantity": quantity,
-                        "price": price,
-                        "order_id": order_id,
-                        "reason": reason,
-                    }
-                )
+                results.append({
+                    "ticker": broker_symbol,
+                    "action": "BUY_SIGNAL",
+                    "execution_status": "PAPER_FILLED",
+                    "quantity": quantity,
+                    "reference_price": price,
+                    "fill_price": fill_price,
+                    "order_id": order_id,
+                    "fees": self._execution_order(order_id).get("fees", 0.0),
+                    "reason": reason,
+                })
 
             except Exception:
-
                 logger.error(
                     "Entry analysis failed for %s.",
                     broker_symbol,
@@ -2485,9 +2575,10 @@ class SmartIntradayBot:
                 # PRICE STATE
                 # ---------------------------------------------------------
 
-                position.current_price = (
-                    current
-                )
+                position.current_price = current
+                mark_price = getattr(self.executor, "mark_price", None)
+                if callable(mark_price) and self.config.mode == "trader":
+                    mark_price(position.ticker, current)
 
                 position.peak_price = max(
                     position.peak_price,
@@ -2616,11 +2707,26 @@ class SmartIntradayBot:
 
                     continue
 
-                order_id = (
-                    self.executor.sell(
-                        intent
+                if self.config.mode == "advisory":
+                    recommendation = {
+                        "ticker": position.ticker,
+                        "action": "SELL_RECOMMENDATION",
+                        "quantity": position.quantity,
+                        "price": current,
+                        "reason": str(reason),
+                        "mode": "advisory",
+                    }
+                    logger.info(
+                        "ADVISORY SELL | %s | qty=%s | price=%.2f | reason=%s",
+                        position.ticker,
+                        position.quantity,
+                        current,
+                        reason,
                     )
-                )
+                    results.append(recommendation)
+                    continue
+
+                order_id = self.executor.sell(intent)
 
                 if not order_id:
 
@@ -2638,55 +2744,33 @@ class SmartIntradayBot:
 
                     continue
 
-                # ---------------------------------------------------------
-                # PAPER POSITION CLOSE
-                # ---------------------------------------------------------
+                fill_price = self._execution_price(order_id, current)
+                closed = self.ledger.close(position, fill_price, order_id, str(reason))
+                if not closed:
+                    rollback = getattr(self.executor, "rollback_order", None)
+                    rolled_back = bool(rollback(order_id, "INTRADAY_LEDGER_EXIT_FAILED")) if callable(rollback) else False
+                    logger.error("Paper SELL ledger close failed for %s; simulator rollback=%s", position.ticker, rolled_back)
+                    results.append({
+                        "ticker": position.ticker, "action": "SELL_RECONCILIATION_ERROR",
+                        "quantity": position.quantity, "reference_price": current, "fill_price": fill_price,
+                        "order_id": order_id, "ledger_closed": False, "simulator_rollback": rolled_back,
+                    })
+                    continue
 
-                closed = (
-                    self.ledger.close(
-                        position,
-                        current,
-                        order_id,
-                        str(reason),
-                    )
+                order_data = self._execution_order(order_id)
+                gross_pnl = (fill_price - position.entry_price) * position.quantity
+                pnl = float(order_data.get("realized_pnl_delta", gross_pnl))
+                self.daily_pnl += pnl
+                self.ledger.record_trade(
+                    ticker=position.ticker, action="SELL", quantity=position.quantity, price=fill_price,
+                    order_id=order_id, reason=str(reason), status="PAPER_FILLED", session_date=position.session_date,
                 )
-
-                pnl = (
-                    current
-                    - position.entry_price
-                ) * position.quantity
-
-                if closed:
-
-                    self.daily_pnl += pnl
-
-                    self.ledger.record_trade(
-                        ticker=position.ticker,
-                        action="SELL",
-                        quantity=position.quantity,
-                        price=current,
-                        order_id=order_id,
-                        reason=str(
-                            reason
-                        ),
-                        status="PAPER",
-                        session_date=position.session_date,
-                    )
-
-                results.append(
-                    {
-                        "ticker": position.ticker,
-                        "action": "SELL_SIGNAL",
-                        "quantity": position.quantity,
-                        "price": current,
-                        "order_id": order_id,
-                        "reason": str(
-                            reason
-                        ),
-                        "pnl": pnl,
-                        "ledger_closed": closed,
-                    }
-                )
+                results.append({
+                    "ticker": position.ticker, "action": "PAPER_SELL_FILLED", "quantity": position.quantity,
+                    "reference_price": current, "fill_price": fill_price, "order_id": order_id,
+                    "fees": order_data.get("fees", 0.0), "reason": str(reason),
+                    "net_realized_pnl": pnl, "ledger_closed": True,
+                })
 
             except Exception:
 
@@ -2819,11 +2903,26 @@ class SmartIntradayBot:
 
                     continue
 
-                order_id = (
-                    self.executor.sell(
-                        intent
+                if self.config.mode == "advisory":
+                    results.append(
+                        {
+                            "ticker": position.ticker,
+                            "action": "EXPIRY_SELL_RECOMMENDATION",
+                            "quantity": position.quantity,
+                            "price": price,
+                            "reason": "DAILY_EXPIRY",
+                            "mode": "advisory",
+                        }
                     )
-                )
+                    logger.warning(
+                        "ADVISORY EXPIRY SELL | %s | qty=%s | price=%.2f",
+                        position.ticker,
+                        position.quantity,
+                        price,
+                    )
+                    continue
+
+                order_id = self.executor.sell(intent)
 
                 if not order_id:
 
@@ -2839,47 +2938,28 @@ class SmartIntradayBot:
 
                     continue
 
-                closed = (
-                    self.ledger.close(
-                        position,
-                        price,
-                        order_id,
-                        "DAILY_EXPIRY",
-                    )
+                fill_price = self._execution_price(order_id, price)
+                closed = self.ledger.close(position, fill_price, order_id, "DAILY_EXPIRY")
+                if not closed:
+                    rollback = getattr(self.executor, "rollback_order", None)
+                    rolled_back = bool(rollback(order_id, "INTRADAY_EXPIRY_LEDGER_FAILED")) if callable(rollback) else False
+                    logger.critical("Expiry paper SELL ledger close failed for %s; simulator rollback=%s", position.ticker, rolled_back)
+                    results.append({"ticker": position.ticker, "action": "EXPIRY_RECONCILIATION_ERROR",
+                                    "order_id": order_id, "ledger_closed": False, "simulator_rollback": rolled_back})
+                    continue
+
+                order_data = self._execution_order(order_id)
+                gross_pnl = (fill_price - position.entry_price) * position.quantity
+                pnl = float(order_data.get("realized_pnl_delta", gross_pnl))
+                self.daily_pnl += pnl
+                self.ledger.record_trade(
+                    ticker=position.ticker, action="SELL", quantity=position.quantity, price=fill_price,
+                    order_id=order_id, reason="DAILY_EXPIRY", status="PAPER_FILLED", session_date=position.session_date,
                 )
-
-                pnl = (
-                    price
-                    - position.entry_price
-                ) * position.quantity
-
-                if closed:
-
-                    self.daily_pnl += pnl
-
-                    self.ledger.record_trade(
-                        ticker=position.ticker,
-                        action="SELL",
-                        quantity=position.quantity,
-                        price=price,
-                        order_id=order_id,
-                        reason="DAILY_EXPIRY",
-                        status="PAPER",
-                        session_date=position.session_date,
-                    )
-
-                results.append(
-                    {
-                        "ticker": position.ticker,
-                        "action": "EXPIRY_SELL_SIGNAL",
-                        "quantity": position.quantity,
-                        "price": price,
-                        "order_id": order_id,
-                        "reason": "DAILY_EXPIRY",
-                        "pnl": pnl,
-                        "ledger_closed": closed,
-                    }
-                )
+                results.append({"ticker": position.ticker, "action": "PAPER_EXPIRY_SELL_FILLED",
+                                "quantity": position.quantity, "reference_price": price, "fill_price": fill_price,
+                                "order_id": order_id, "reason": "DAILY_EXPIRY", "net_realized_pnl": pnl,
+                                "ledger_closed": True})
 
             except Exception:
 
@@ -3274,16 +3354,22 @@ class SmartIntradayBot:
             "session_date": (
                 self.gate.session_date
             ),
+            "mode": self.config.mode,
             "execution_mode": (
                 self.config.execution_mode
             ),
+            "execution_backend": self.config.execution_backend,
             "live_requested": (
                 self.config.live_trading_requested
             ),
             "open_positions": len(
                 positions
             ),
-            "daily_pnl": self.daily_pnl,
+            "daily_pnl": (
+                self.executor.session_pnl(dt.datetime.now(IST).date().isoformat())
+                if self.config.mode == "trader" and callable(getattr(self.executor, "session_pnl", None))
+                else self.daily_pnl
+            ),
             "positions": [
                 {
                     "ticker": p.ticker,
@@ -3300,6 +3386,7 @@ class SmartIntradayBot:
                 for p in positions
             ],
             "config": self.config.summary(),
+            "paper_account": self.executor.snapshot() if self.config.mode == "trader" and callable(getattr(self.executor, "snapshot", None)) else None,
         }
 
 
@@ -3395,7 +3482,9 @@ def get_intraday_status(
             return {
                 "active": False,
                 "killed": False,
+                "mode": "advisory",
                 "execution_mode": "ADVISORY",
+                "execution_backend": "NONE",
                 "open_positions": 0,
                 "daily_pnl": 0.0,
                 "positions": [],

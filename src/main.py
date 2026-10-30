@@ -1,6 +1,9 @@
 """
 ASTRA - 24x7 Persistent Main Orchestrator
 
+Rewritten orchestration baseline: resilient wallet handling, independent
+Google Sheets telemetry, shared intraday/SIP runtimes, and graceful shutdown.
+
 Responsibilities:
     - Load runtime configuration.
     - Run the existing ASTRA market-analysis pipeline.
@@ -15,13 +18,17 @@ Responsibilities:
     - Continue dashboard/database telemetry while NSE is closed.
 
 Intraday modes:
-    /intraday
-        Daily Telegram activation. The intraday engine expires at 15:30 IST.
+    INTRADAY.mode = "advisory" | "trader"
 
-The intraday peripheral is intentionally NOT exposed as a CLI mode.
-Autonomous intraday trading is activated only through the Telegram
-``/intraday`` command and is automatically squared off at the end of the
-NSE session.
+    advisory:
+        Keep the system in its existing advisory/paper-only execution path.
+
+    trader:
+        Run the intraday engine's automatic paper-trading executor. Live broker
+        orders remain disabled until a verified execution gateway is implemented.
+
+The intraday peripheral can be activated through Telegram or the explicit
+terminal ``--intraday`` option and expires at the NSE session boundary.
 """
 
 from __future__ import annotations
@@ -456,6 +463,21 @@ def _setting_str(path: str, default: str) -> str:
     return default if value is None else str(value)
 
 
+def get_intraday_mode() -> str:
+    """Return validated mode, accepting both MODE and mode JSON keys."""
+    raw_mode = get_setting("INTRADAY.MODE", None)
+    if raw_mode is None:
+        raw_mode = get_setting("INTRADAY.mode", "advisory")
+    raw_mode = str(raw_mode or "advisory").strip().lower()
+    if raw_mode not in {"advisory", "trader"}:
+        logger.warning(
+            "Invalid INTRADAY.MODE=%r; falling back to 'advisory'.",
+            raw_mode,
+        )
+        return "advisory"
+    return raw_mode
+
+
 def load_runtime_config(force_email_now: bool = False) -> dict[str, Any]:
     """Load and normalize all runtime configuration consumed by main.py."""
     normal_min = _setting_float("NORMAL_TRADING.MIN_TRADE_ALLOCATION", 100.0)
@@ -478,10 +500,20 @@ def load_runtime_config(force_email_now: bool = False) -> dict[str, Any]:
         "enable_tsl": normal_tsl,
         "tickers_count": max(1, _setting_int("NORMAL_TRADING.TICKERS_COUNT", 50)),
         "mailer_mode": "NOW" if force_email_now else _setting_str("mailer.TIME", "EOD").upper(),
-        # Google credentials are infrastructure/secrets and remain in .env.
-        "spreadsheet_id": _setting_str("GOOGLE_SHEETS.SPREADSHEET_ID", ""),
-        "credentials_file": BASE_DIR / _setting_str(
-            "GOOGLE_SHEETS.SERVICE_ACCOUNT_FILE", "service_account.json"
+        # Prefer settings.json, but accept legacy .env variable names as a
+        # compatibility fallback. Never log the spreadsheet ID or credential contents.
+        "spreadsheet_id": (
+            _setting_str("GOOGLE_SHEETS.SPREADSHEET_ID", "").strip()
+            or os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
+            or os.getenv("SPREADSHEET_ID", "").strip()
+            or os.getenv("GOOGLE_SHEET_ID", "").strip()
+        ),
+        "credentials_file": BASE_DIR / (
+            _setting_str("GOOGLE_SHEETS.SERVICE_ACCOUNT_FILE", "").strip()
+            or os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE", "").strip()
+            or os.getenv("SERVICE_ACCOUNT_FILE", "").strip()
+            or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+            or "service_account.json"
         ),
         "active_cycle_minutes": max(1, _setting_int("ASTRA_FUNCTIONS.ACTIVE_CYCLE_BUFFER", 5)),
         "passive_cycle_minutes": max(1, _setting_int("ASTRA_FUNCTIONS.PASSIVE_CYCLE_BUFFER", 15)),
@@ -1596,37 +1628,63 @@ def sync_sheets(
     config: dict[str, Any],
     processed_rows: list[list[Any]],
     raw_data: list[dict[str, Any]],
-    real_portfolio: dict[str, Any],
+    real_portfolio: Optional[dict[str, Any]],
     sip_data: Optional[list[dict[str, Any]]] = None,
     sip_decisions: Optional[list[dict[str, Any]]] = None,
 ) -> None:
-    """Synchronize market and wallet telemetry to Google Sheets."""
+    """Sync independent dashboards even when broker wallet state is unknown.
+
+    ``real_portfolio=None`` is a deliberate sentinel: it tells the dashboard
+    writer to skip only ``Wallet_and_Holdings`` and preserve its last-known-good
+    contents. It must never be converted into an empty/zero wallet.
+    """
     credentials_file = config["credentials_file"]
     spreadsheet_id = config["spreadsheet_id"]
 
     if not credentials_file.exists():
-        logger.debug(
-            "Google service-account file not found. "
-            "Skipping Sheets synchronization."
+        logger.warning(
+            "Google Sheets sync skipped: service-account credentials file is missing (%s).",
+            credentials_file,
         )
         return
 
     if not spreadsheet_id:
-        logger.debug(
-            "Google spreadsheet ID not configured. "
-            "Skipping Sheets synchronization."
+        logger.warning(
+            "Google Sheets sync skipped: spreadsheet ID is not configured. "
+            "Set GOOGLE_SHEETS.SPREADSHEET_ID in settings.json or "
+            "GOOGLE_SHEETS_SPREADSHEET_ID/SPREADSHEET_ID in .env."
         )
         return
 
+    logger.info(
+        "Google Sheets config resolved | spreadsheet_id_configured=%s | credentials_file_exists=%s | credentials_path=%s",
+        bool(spreadsheet_id),
+        credentials_file.exists(),
+        credentials_file,
+    )
+
     try:
-        sheets_portfolio = _normalize_wallet_and_holdings_for_sheets(
-            real_portfolio
+        sheets_portfolio = (
+            _normalize_wallet_and_holdings_for_sheets(real_portfolio)
+            if real_portfolio is not None
+            else None
         )
 
-        logger.debug(
-            "Wallet_and_Holdings schema locked to %d columns: %s",
-            len(WALLET_AND_HOLDINGS_COLUMNS),
-            ", ".join(WALLET_AND_HOLDINGS_COLUMNS),
+        if sheets_portfolio is None:
+            logger.warning(
+                "Wallet_and_Holdings update skipped because broker wallet state is unknown; "
+                "the existing worksheet will be preserved. Other dashboard tabs will still sync."
+            )
+        else:
+            logger.debug(
+                "Wallet_and_Holdings schema locked to %d columns: %s",
+                len(WALLET_AND_HOLDINGS_COLUMNS),
+                ", ".join(WALLET_AND_HOLDINGS_COLUMNS),
+            )
+
+        logger.info(
+            "Starting Google Sheets dashboard synchronization (wallet=%s).",
+            "available" if sheets_portfolio is not None else "preserve-existing",
         )
 
         sync_dashboard_data(
@@ -1645,6 +1703,7 @@ def sync_sheets(
             sip_tab_name="SIP",
             sip_decisions_tab_name="SIP_Decisions",
         )
+        logger.info("Google Sheets dashboard synchronization call completed.")
 
     except Exception as exc:
         logger.error(
@@ -1811,30 +1870,30 @@ def run_pipeline(
         strategy_enabled=strategy_enabled,
     )
 
+    logger.info(
+        "Market scan completed: valid_tickers=%d | rows=%d | wallet_strategy=%s | phase=%s",
+        len(_scan_results),
+        max(0, len(processed_rows) - 1),
+        "enabled" if strategy_enabled else "disabled",
+        phase,
+    )
+
     # Persist system phase information for the long-running timeline.
     db.log_system(
         "INFO",
         f"Market phase complete | phase={phase} | tickers_processed={len(raw_data)}",
     )
 
-    # Dashboard synchronization is 24x7, but the wallet tab must never be
-    # overwritten with an empty/unknown broker state. When the broker is
-    # unavailable, preserve the existing Sheets wallet snapshot and continue
-    # the safe DB/market-data telemetry path.
-    if wallet_valid:
-        sync_sheets(
-            config=config,
-            processed_rows=processed_rows,
-            raw_data=raw_data,
-            real_portfolio=real_portfolio,
-            sip_data=sip_data,
-            sip_decisions=sip_decisions,
-        )
-    else:
-        logger.warning(
-            "Skipping Google Sheets synchronization for this cycle because "
-            "wallet state is unavailable; existing wallet history is preserved."
-        )
+    # Dashboard tabs are independent. Always sync market/SIP telemetry; pass
+    # None for an unknown wallet so the writer skips only Wallet_and_Holdings.
+    sync_sheets(
+        config=config,
+        processed_rows=processed_rows,
+        raw_data=raw_data,
+        real_portfolio=real_portfolio if wallet_valid else None,
+        sip_data=sip_data,
+        sip_decisions=sip_decisions,
+    )
 
     maybe_send_email(config=config, available_cash=available_cash)
 
@@ -1915,8 +1974,9 @@ def run_intraday_peripheral() -> None:
     """Run one Smart Intraday step and enforce the daily expiry boundary.
 
     Telegram and main.py intentionally use the same process-wide
-    SmartIntradayBot instance. When ALWAYS_ACTIVE_INTRADAY=true, this
-    function activates that shared bot automatically during the NSE session.
+    SmartIntradayBot instance. INTRADAY.TRADING_ENGINE=true enables automatic
+    activation during the NSE session; ALWAYS_ACTIVE_INTRADAY remains a legacy
+    .env override.
     """
     try:
         bot = get_smart_intraday_bot(
@@ -1924,6 +1984,21 @@ def run_intraday_peripheral() -> None:
             db,
         )
         now = now_ist()
+        configured_mode = get_intraday_mode()
+
+        engine_enabled = _setting_bool("INTRADAY.TRADING_ENGINE", False)
+        if not engine_enabled:
+            logger.info(
+                "Smart Intraday engine disabled by INTRADAY.TRADING_ENGINE=false."
+            )
+            return
+
+        if configured_mode == "trader":
+            logger.warning(
+                "INTRADAY.MODE=trader selected: automatic PAPER trading is enabled; "
+                "LIVE_TRADING=%s. This build does not submit live Angel One orders.",
+                _setting_bool("INTRADAY.LIVE_TRADING", False),
+            )
 
         if now.weekday() >= 5:
             return
@@ -1939,7 +2014,7 @@ def run_intraday_peripheral() -> None:
         # ALWAYS_ACTIVE_INTRADAY
         # ---------------------------------------------------------------
         if (
-            ALWAYS_ACTIVE_INTRADAY
+            (ALWAYS_ACTIVE_INTRADAY or engine_enabled)
             and not blocked
             and MARKET_OPEN <= now.timetz() < MARKET_CLOSE
             and not bot.gate.allowed()
@@ -1949,18 +2024,19 @@ def run_intraday_peripheral() -> None:
             )
             if activated:
                 logger.info(
-                    "ALWAYS_ACTIVE_INTRADAY override activated Smart Intraday | session=%s | expiry=15:30 IST",
+                    "Automatic intraday activation enabled | session=%s | expiry=15:30 IST",
                     now.date().isoformat(),
                 )
 
         state = bot.status()
         logger.info(
-            "\033[1;38;2;0;255;0mIntraday state\033[0m: active=%s | killed=%s | session=%s | open_positions=%s | daily_pnl=%.2f | mode=%s",
+            "\033[1;38;2;0;255;0mIntraday state\033[0m: active=%s | killed=%s | session=%s | open_positions=%s | daily_pnl=%.2f | configured_mode=%s | engine_mode=%s",
             state.get("active", False),
             state.get("killed", False),
             state.get("session_date"),
             state.get("open_positions", 0),
             float(state.get("daily_pnl", 0.0) or 0.0),
+            configured_mode.upper(),
             state.get("execution_mode", "ADVISORY"),
         )
 
@@ -2073,15 +2149,17 @@ def run(
                     MARKET_CLOSE,
                     tzinfo=IST,
                 )
-                bot.activate(
-                    now.date().isoformat(),
-                    expiry,
-                )
-                logger.info(
-                    "Console --intraday activation: ACTIVE | session=%s | expiry=%s",
-                    now.date().isoformat(),
-                    expiry.strftime("%Y-%m-%d %H:%M:%S %Z"),
-                )
+                activated = bot.activate(now.date().isoformat())
+                if activated:
+                    logger.info(
+                        "Console --intraday activation: ACTIVE | session=%s | expiry=%s",
+                        now.date().isoformat(),
+                        expiry.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                    )
+                else:
+                    logger.warning(
+                        "Console --intraday activation was rejected by the intraday session gate."
+                    )
         except Exception as exc:
             logger.exception(
                 "Console --intraday activation failed: %s",
@@ -2108,8 +2186,6 @@ def run(
     email_now_pending = force_email_now
 
     while not shutdown_event.is_set():
-
-        cycle_started = time.monotonic()
 
         try:
             market_active = run_pipeline(

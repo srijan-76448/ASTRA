@@ -8,7 +8,7 @@ Responsibilities
 - Persist normal ASTRA signal history.
 - Persist portfolio snapshots.
 - Persist system logs.
-- Persist intraday sessions and recommendations.
+- Persist intraday sessions, ASTRA-owned holdings, recommendations, and trade telemetry.
 - Persist V3 SIP targets.
 - Persist V3 SIP contribution history.
 - Persist V3 SIP decision telemetry.
@@ -134,7 +134,11 @@ def _configured_db_path() -> Path:
 #
 # Version 2:
 #     Adds V3 SIP persistence tables.
-_SCHEMA_VERSION = 3
+# Version 3:
+#     Adds runtime-configurable SQLite settings and additive intraday migrations.
+# Version 4:
+#     Adds persistent intraday trade-event telemetry.
+_SCHEMA_VERSION = 4
 
 
 # ============================================================================
@@ -545,7 +549,31 @@ class DatabaseManager:
 
 
     -- ============================================================
-    -- ASTRA V3: SIP TARGETS
+    -- ASTRA V2: INTRADAY TRADE TELEMETRY
+            -- ============================================================
+
+            CREATE TABLE IF NOT EXISTS intraday_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                session_date TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                action TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                order_id TEXT,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL,
+                metadata TEXT
+            );
+
+            -- Intraday-trade indexes are created after additive migrations.
+            -- Older databases may already have this table without every
+            -- column in the current schema.
+
+
+            -- ============================================================
+            -- ASTRA V3: SIP TARGETS
             -- ============================================================
 
             CREATE TABLE IF NOT EXISTS sip_targets (
@@ -739,6 +767,50 @@ class DatabaseManager:
                 "SQLite migration: added intraday_holdings.%s",
                 name,
             )
+
+        # Older ASTRA builds may have created intraday_trades before the
+        # timestamp field was introduced.  Do not create its timestamp index
+        # in _create_schema(): CREATE TABLE IF NOT EXISTS does not add columns
+        # to an existing table, so that index would fail before migrations run.
+        trade_columns = columns("intraday_trades")
+        if trade_columns:
+            if "timestamp" not in trade_columns:
+                conn.execute(
+                    "ALTER TABLE intraday_trades ADD COLUMN timestamp TEXT"
+                )
+                logger.info(
+                    "SQLite migration: added intraday_trades.timestamp"
+                )
+                trade_columns.add("timestamp")
+
+            # Preserve historical rows and provide a timestamp for legacy
+            # records before indexing them. Existing timestamp values remain.
+            trade_now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE intraday_trades SET timestamp = ? WHERE timestamp IS NULL",
+                (trade_now,),
+            )
+
+            # Create these indexes only after required legacy columns exist.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intraday_trades_timestamp "
+                "ON intraday_trades(timestamp)"
+            )
+            if {"session_date"}.issubset(trade_columns):
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_trades_session_date "
+                    "ON intraday_trades(session_date)"
+                )
+            if {"owner", "ticker"}.issubset(trade_columns):
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_trades_owner_ticker "
+                    "ON intraday_trades(owner, ticker)"
+                )
+            if "order_id" in trade_columns:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_intraday_trades_order_id "
+                    "ON intraday_trades(order_id)"
+                )
 
         # Backfill timestamps for rows created by an older schema.  These
         # rows are historical/open ownership records, so preserving them is
@@ -1434,6 +1506,103 @@ class DatabaseManager:
             )
             return False
 
+
+    def record_intraday_trade(
+        self,
+        *,
+        ticker: str,
+        action: str,
+        quantity: int,
+        price: float,
+        order_id: Optional[str],
+        reason: str,
+        status: str,
+        session_date: str,
+        owner: str = "ASTRA_INTRADAY",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Persist an intraday event; this method never places broker orders.
+
+        A telemetry row is not proof of a broker fill. The caller must pass
+        the event's real status and reconcile broker execution independently.
+        """
+        normalized_ticker = str(ticker or "").strip().upper()
+        normalized_action = str(action or "").strip().upper()
+        normalized_owner = str(owner or "").strip()
+        normalized_status = str(status or "").strip().upper()
+        normalized_session_date = str(session_date or "").strip()
+
+        if not all((normalized_ticker, normalized_action, normalized_owner,
+                    normalized_status, normalized_session_date)):
+            logger.warning("Skipping intraday trade record: required fields missing.")
+            return False
+
+        safe_quantity = self._safe_int(quantity, default=-1)
+        if safe_quantity < 0:
+            logger.warning("Skipping intraday trade record for %s: invalid quantity %r", normalized_ticker, quantity)
+            return False
+
+        try:
+            with self._connection() as conn:
+                conn.execute(
+                    """INSERT INTO intraday_trades (
+                        timestamp, session_date, owner, ticker, action,
+                        quantity, price, order_id, reason, status, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        self._utc_now(), normalized_session_date, normalized_owner,
+                        normalized_ticker, normalized_action, safe_quantity,
+                        self._safe_float(price), None if order_id is None else str(order_id),
+                        str(reason or ""), normalized_status,
+                        self._json_dumps(metadata) if metadata is not None else None,
+                    ),
+                )
+            return True
+        except sqlite3.Error:
+            logger.exception("Failed to persist intraday trade event for %s (%s)", normalized_ticker, normalized_action)
+            return False
+
+    def get_intraday_trades(
+        self,
+        *,
+        session_date: Optional[str] = None,
+        owner: Optional[str] = None,
+        ticker: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return recent intraday trade telemetry, newest first."""
+        conditions: list[str] = []
+        values: list[Any] = []
+        if session_date is not None:
+            conditions.append("session_date = ?")
+            values.append(str(session_date))
+        if owner is not None:
+            conditions.append("owner = ?")
+            values.append(str(owner))
+        if ticker is not None:
+            conditions.append("ticker = ?")
+            values.append(str(ticker).strip().upper())
+
+        safe_limit = max(1, min(self._safe_int(limit, default=500), 5000))
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+        try:
+            with self._connection() as conn:
+                rows = conn.execute(
+                    f"""SELECT id, timestamp, session_date, owner, ticker, action,
+                               quantity, price, order_id, reason, status, metadata
+                        FROM intraday_trades {where_clause}
+                        ORDER BY id DESC LIMIT ?""",
+                    (*values, safe_limit),
+                ).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                item["metadata"] = self._json_loads(item.get("metadata"), {})
+                result.append(item)
+            return result
+        except sqlite3.Error:
+            logger.exception("Failed to read intraday trade telemetry.")
+            return []
 
     # ========================================================================
     # INTRADAY CANDIDATES
